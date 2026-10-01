@@ -11,15 +11,17 @@ and RDMs are not supported.
 
 from __future__ import annotations
 
+import fcntl
 import logging
 import os
+import struct
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
 from pyVmomi import vim
 
-from openvixdisklib.nfc_open import ReadResult
+from openvixdisklib.nfc_open import DiskGeometry, DiskInfo, ReadResult
 
 LOG = logging.getLogger(__name__)
 
@@ -37,6 +39,8 @@ DMI_VENDOR_PATH = "/sys/class/dmi/id/sys_vendor"
 DMI_UUID_PATH = "/sys/class/dmi/id/product_uuid"
 SCSI_HOST_DIR = "/sys/class/scsi_host"
 SCSI_DEVICE_DIR = "/sys/bus/scsi/devices"
+# Linux BLKGETSIZE64: size of a block device in bytes.
+_BLKGETSIZE64 = 0x80081272
 
 
 def is_vmware_guest() -> bool:
@@ -152,7 +156,12 @@ def _walk_snapshots(
 def source_devices(
     vm: vim.VirtualMachine, snapshot_ref: str | None
 ) -> list[vim.vm.device.VirtualDevice]:
-    """Return hardware devices of ``vm``, or of ``snapshot_ref`` when set."""
+    """Return hardware devices of ``vm``, or of ``snapshot_ref`` when set.
+
+    ``snapshot_ref`` matches a ``SnapshotTree`` node. That node has no
+    hardware config; the devices are on ``tree.snapshot``, the
+    ``vim.vm.Snapshot`` object.
+    """
     if snapshot_ref:
         if vm.snapshot is None:
             raise RuntimeError(f"{vm._moId} has no snapshots")
@@ -160,7 +169,7 @@ def source_devices(
         tree = _walk_snapshots(vm.snapshot.rootSnapshotList, moref)
         if tree is None:
             raise RuntimeError(f"snapshot {moref} not found on {vm._moId}")
-        return list(tree.config.hardware.device)
+        return list(tree.snapshot.config.hardware.device)
     return list(vm.config.hardware.device)
 
 
@@ -520,6 +529,17 @@ def _pwrite_all(fd: int, data: bytes, offset: int) -> None:
         pos += written
 
 
+def _capacity_bytes(fd: int) -> int:
+    """Return the size of an open block device or regular file."""
+    try:
+        raw = fcntl.ioctl(fd, _BLKGETSIZE64, b"\x00" * 8)
+    except OSError:
+        size = os.lseek(fd, 0, os.SEEK_END)
+        os.lseek(fd, 0, os.SEEK_SET)
+        return size
+    return struct.unpack("Q", raw)[0]
+
+
 class HotAddDisk:
     """A locally attached HotAdd VMDK opened as a SCSI block device."""
 
@@ -531,6 +551,7 @@ class HotAddDisk:
         unit_number: int,
         detach: Callable[[], None],
         sector_size: int = SECTOR_SIZE,
+        info: DiskInfo | None = None,
     ) -> None:
         """Wrap an open block-device fd and a detach callback.
 
@@ -541,6 +562,7 @@ class HotAddDisk:
             unit_number: VMware SCSI unit of the attached disk.
             detach: Called from ``close`` after the fd is closed.
             sector_size: Sector size in bytes (VDDK uses 512).
+            info: Capacity of the block device. ``None`` until known.
         """
         self._fd = fd
         self.dev_path = dev_path
@@ -548,6 +570,8 @@ class HotAddDisk:
         self.unit_number = unit_number
         self._detach = detach
         self.sector_size = sector_size
+        self.info = info
+        self.nfc_version = None
         self._closed = False
 
     def readinto(
@@ -708,7 +732,12 @@ def open_disk(
         finally:
             wait_scsi_device_gone(bus, unit)
 
-    return HotAddDisk(fd, dev_path, bus, unit, _detach)
+    size = _capacity_bytes(fd)
+    info = DiskInfo(
+        capacity_sectors=size // SECTOR_SIZE,
+        phys_geo=DiskGeometry(cylinders=0, heads=0, sectors=0),
+    )
+    return HotAddDisk(fd, dev_path, bus, unit, _detach, info=info)
 
 
 def _detach_best_effort(
