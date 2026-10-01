@@ -20,15 +20,11 @@ class _FakeSocket:
     def sendall(self, data: bytes) -> None:
         self.sent.append(bytes(data))
 
-    def recv_into(self, buffer: memoryview, nbytes: int = 0, flags: int = 0) -> int:
-        del nbytes, flags
-        n = min(len(buffer), len(self._replies))
-        buffer[:n] = self._replies[:n]
+    def recv_into(self, buf: memoryview) -> int:
+        n = min(len(buf), len(self._replies))
+        buf[:n] = self._replies[:n]
         self._replies = self._replies[n:]
         return n
-
-    def close(self) -> None:
-        pass
 
 
 def _open_reply_body(
@@ -50,24 +46,71 @@ def _open_reply_body(
     return bytes(body)
 
 
+class TestDecodeAllocatedBitmap:
+    def test_merges_contiguous_runs(self) -> None:
+        """Contiguous set bits become one run; gaps split into separate ones."""
+        # chunks: 1,1,1,1,0,0,0,0,1,1 (10 chunks -> 2 bytes, LSB-first)
+        bitmap = bytes([0b00001111, 0b00000011])
+        blocks = nfc_open._decode_allocated_bitmap(
+            bitmap, chunk_count=10, start_sector=1000, chunk_size_sectors=128
+        )
+        assert blocks == (
+            nfc_open.AllocatedBlock(offset=1000, length=4 * 128),
+            nfc_open.AllocatedBlock(offset=1000 + 8 * 128, length=2 * 128),
+        )
+
+    def test_all_zero_bitmap_returns_no_blocks(self) -> None:
+        """A bitmap with no set bits produces an empty result."""
+        blocks = nfc_open._decode_allocated_bitmap(
+            bytes(4), chunk_count=16, start_sector=0, chunk_size_sectors=128
+        )
+        assert blocks == ()
+
+    def test_run_extending_to_the_end_is_closed(self) -> None:
+        """A run of set bits reaching the last chunk is still reported."""
+        # chunks: 0,1,1,1 (4 chunks, 1 byte; only lower nibble meaningful)
+        bitmap = bytes([0b00001110])
+        blocks = nfc_open._decode_allocated_bitmap(
+            bitmap, chunk_count=4, start_sector=0, chunk_size_sectors=1
+        )
+        assert blocks == (nfc_open.AllocatedBlock(offset=1, length=3),)
+
+    def test_ignores_bits_beyond_chunk_count(self) -> None:
+        """Padding bits past chunk_count (from 4-byte reply alignment) are unused."""
+        # 2 real chunks (both set) + 2 padding bytes with garbage bits set.
+        bitmap = bytes([0b00000011, 0xFF, 0xFF, 0xFF])
+        blocks = nfc_open._decode_allocated_bitmap(
+            bitmap, chunk_count=2, start_sector=0, chunk_size_sectors=128
+        )
+        assert blocks == (nfc_open.AllocatedBlock(offset=0, length=256),)
+
+
+class TestQueryAllocatedBlocksValidation:
+    def _disk(self) -> nfc_open.NfcDisk:
+        return nfc_open.NfcDisk(sock=None, path="[ds] a.vmdk", handle=1, sector_size=512)
+
+    def test_num_sectors_not_a_multiple_raises(self) -> None:
+        with pytest.raises(ValueError, match="num_sectors must be a multiple"):
+            self._disk().query_allocated_blocks(0, 100, chunk_size_sectors=128)
+
+    def test_start_sector_not_a_multiple_raises(self) -> None:
+        with pytest.raises(ValueError, match="start_sector must be a multiple"):
+            self._disk().query_allocated_blocks(100, 128, chunk_size_sectors=128)
+
+
 def _ddb_get_reply(op_id: int, value: bytes | None) -> bytes:
     """Build a scripted DDB_GET reply: header + 16-byte body + value extra."""
     value_length = len(value) if value is not None else 0
     body = bytes(12) + struct.pack("<I", value_length)
-    return (
-        nfc_open._pack_aio_hdr(nfc_open.NFC_AIO_MSG_DDB_GET, 16, op_id)
-        + body
-        + (value or b"")
+    return nfc_open._pack_aio_hdr(nfc_open.NFC_AIO_MSG_DDB_GET, 16, op_id) + body + (
+        value or b""
     )
 
 
 class TestDdbGet:
     def _disk(self, replies: bytes) -> nfc_open.NfcDisk:
         return nfc_open.NfcDisk(
-            sock=_FakeSocket(replies),
-            path="[ds] a.vmdk",
-            handle=0x1234,
-            sector_size=512,
+            sock=_FakeSocket(replies), path="[ds] a.vmdk", handle=0x1234, sector_size=512
         )
 
     def test_found_key_returns_decoded_value(self) -> None:
@@ -128,12 +171,8 @@ class TestQueryFullInfo:
         )
         info = disk.query_full_info()
         assert info.capacity_sectors == 1024
-        assert info.phys_geo == nfc_open.DiskGeometry(
-            cylinders=10, heads=20, sectors=30
-        )
-        assert info.bios_geo == nfc_open.DiskGeometry(
-            cylinders=100, heads=200, sectors=63
-        )
+        assert info.phys_geo == nfc_open.DiskGeometry(cylinders=10, heads=20, sectors=30)
+        assert info.bios_geo == nfc_open.DiskGeometry(cylinders=100, heads=200, sectors=63)
         assert info.adapter_type == "lsilogic"
         assert info.uuid == "some-uuid"
 
