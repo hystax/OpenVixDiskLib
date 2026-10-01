@@ -321,7 +321,6 @@ I/O: `docs/nfc_read.md`, `docs/nfc_write.md`, and
   implemented for the plain, non-encrypted keys covered above)
 - `NFC_DELTA_DISK`, change-block tracking
 - Host-switch (`NFC_AIO_SWITCH_HOST_*`)
-- Direct ESXi `ha-nfc` without vCenter `vpxa-nfc`
 
 Reads after open are in `docs/nfc_read.md`. Writes are in
 `docs/nfc_write.md`.
