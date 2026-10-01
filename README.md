@@ -13,13 +13,14 @@ Python naming).
 
 VIM login and inventory use [pyVmomi](https://github.com/vmware/pyvmomi).
 The NFC ticket, ESXi authd handshake, and disk I/O were reverse-engineered
-from VDDK 8 NBD traffic; see `docs/`.
+from VDDK 8 NBD traffic; see `docs/`. Linux HotAdd uses the public
+vSphere `ReconfigureVM` API (see `docs/hotadd.md`).
 
 ## Status
 
 Supported and tested on **vCenter 8 / ESXi 8** (lab: 8.0.1), including a
-standalone ESXi host with no vCenter. The
-VixDiskLib compatibility mode is `8.0` only. VIM login requests
+standalone ESXi host with no vCenter. Linux guests can also use `hotadd`.
+The VixDiskLib compatibility mode is `8.0` only. VIM login requests
 pyVmomi's vim25 **8.x** versions, so a newer host such as vSphere 9 stays
 on 8.x SOAP instead of 9.x types.
 
@@ -43,13 +44,16 @@ Default transport is `nbdssl` (`nbd` is still available):
   part of VixDiskLib itself; see `docs/cbt.md`)
 - NBD IO compression: zlib, FastLZ, and SkipZ (`VIXDISKLIB_FLAG_OPEN_COMPRESSION_{ZLIB,FASTLZ,SKIPZ}`;
   see `docs/nfc_read.md`)
+- HotAdd on a Linux VMware guest (SCSI, NVMe, or SATA source disks,
+  attached onto a proxy SCSI controller)
 
 Reading/writing a snapshot delta file directly (and running
 `query_allocated_blocks` against it) already works — `NFC_DELTA_DISK`
 turned out to be an optional VMFS-only VDDK client optimization, not a
 correctness requirement (see `docs/reverse_engineering_procedure.md`).
 
-Not implemented: encrypted disks.
+Not implemented: encrypted disks, SAN / file transports, Windows HotAdd,
+and HotAdd onto a proxy NVMe controller.
 
 Requires Python 3.10 or later.
 
@@ -95,6 +99,7 @@ VDDK-shaped handle.
 | `openvixdisklib/openvixdisklib.py` | Drop-in handle (`connect` / `open` / `read` / `write`) |
 | `openvixdisklib/nfc_auth.py`       | VIM login, NFC ticket, authd on 902                    |
 | `openvixdisklib/nfc_open.py`       | Classic NFC handshake, AIO open, sector read/write     |
+| `openvixdisklib/hotadd.py`         | Linux-guest SCSI HotAdd attach, local block I/O        |
 | `openvixdisklib/fastlz.py`         | FastLZ NFC adapter (pip `pyfastlz`)                    |
 | `tests/integration/`               | Live pytest suite against a lab vCenter                |
 | `tests/perf/`                      | Throughput comparison of OpenVixDiskLib vs VDDK        |
@@ -121,6 +126,9 @@ datastore: datastore0
 esxi:
   username: root
   password: secret
+hotadd_proxy:
+  host: hotadd-proxy.example.com
+  user: root
 ```
 
 A session-scoped pytest fixture creates an empty VM with a 10 GiB thin
@@ -129,6 +137,8 @@ write known patterns and read them back. Direct-ESXi tests pick the lab
 VM's host from vCenter and log into hostd (default ``root`` and the
 vCenter password) so NFC uses ``ha-nfc-service`` instead of
 ``nfcService``. They skip when lockdown is on or hostd login fails.
+HotAdd tests SSH into `hotadd_proxy` (a Linux guest on the same
+datastore) and skip if SSH fails.
 
 ```bash
 tox -e integration
@@ -145,7 +155,10 @@ tox -e integration -- --runslow
 Compare write/read throughput of OpenVixDiskLib and native VDDK
 (`64KiB`, 129-sector, and `32MiB` transfers; `nbdssl` and `nbd`;
 plain, FastLZ, and OpenVixDiskLib FastLZ ``skip_decompression``;
-AIO sessions 64 KiB×1, 1 MiB×1, 2 MiB×1, and 2 MiB×4).
+AIO sessions 64 KiB×1, 1 MiB×1, 2 MiB×1, and 2 MiB×4). The same sizes
+are also timed over Linux-guest ``hotadd`` (plain OpenVixDiskLib I/O
+on `hotadd_proxy`; FastLZ and NFC AIO do not apply) and skipped if
+SSH to the proxy fails.
 
 ```bash
 tox -e perf
@@ -173,5 +186,6 @@ Lint and typecheck: `tox -e pep8`, `tox -e mypy`.
 | `docs/nfc_open.md`                      | Classic NFC and AIO open         |
 | `docs/nfc_read.md`                      | AIO IO / `VixDiskLib_Read`       |
 | `docs/nfc_write.md`                     | AIO IO / `VixDiskLib_Write`      |
+| `docs/hotadd.md`                        | Linux-guest SCSI HotAdd          |
 | `docs/ssl_hook.md`                      | TLS intercept used for capture   |
 | `docs/reverse_engineering_procedure.md` | How the protocol was recovered   |
