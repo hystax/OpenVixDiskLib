@@ -3,6 +3,7 @@
 
 """Exercise the VDDK-compatible openvixdisklib handle against the lab."""
 
+import zlib
 from typing import Any
 
 import pytest
@@ -20,6 +21,7 @@ from tests.integration.base import (
     _connect_vim,
     _wait_for_task,
     pattern_bytes,
+    sparse_bytes,
 )
 
 
@@ -46,6 +48,10 @@ def _rebuild_skip(buf: Any, result: ReadResult) -> bytes:
         packed += frag.length
         if frag.compression_type == nfc_open.NFC_COMPRESSION_FASTLZ:
             chunk = fastlz.decompress(extra, frag.uncompressed_length)
+        elif frag.compression_type == nfc_open.NFC_COMPRESSION_ZLIB:
+            chunk = zlib.decompress(extra)
+        elif frag.compression_type == nfc_open.NFC_COMPRESSION_SKIPZ:
+            chunk = nfc_open._skipz_decompress(extra, frag.uncompressed_length)
         elif frag.compression_type == nfc_open.NFC_COMPRESSION_NONE:
             chunk = extra
         else:
@@ -60,8 +66,13 @@ class TestOpenvixdisklib:
     @pytest.mark.parametrize("transport_mode", ["nbdssl", "nbd"])
     @pytest.mark.parametrize(
         "open_flags",
-        [0, vixdisklib.VIXDISKLIB_FLAG_OPEN_COMPRESSION_FASTLZ],
-        ids=["plain", "fastlz"],
+        [
+            0,
+            vixdisklib.VIXDISKLIB_FLAG_OPEN_COMPRESSION_FASTLZ,
+            vixdisklib.VIXDISKLIB_FLAG_OPEN_COMPRESSION_ZLIB,
+            vixdisklib.VIXDISKLIB_FLAG_OPEN_COMPRESSION_SKIPZ,
+        ],
+        ids=["plain", "fastlz", "zlib", "skipz"],
     )
     def test_write_and_read_sector_zero_and_one_gib(
         self, lab: LabEnv, transport_mode: str, open_flags: int
@@ -243,7 +254,12 @@ class TestOpenvixdisklib:
         read_buf = vixdisklib.get_buffer(SECTOR_SIZE)
 
         si = _connect_vim(
-            lab.host, lab.username, lab.password, lab.port, lab.thumbprint, lab.allow_untrusted
+            lab.host,
+            lab.username,
+            lab.password,
+            lab.port,
+            lab.thumbprint,
+            lab.allow_untrusted,
         )
         try:
             vm = vim.VirtualMachine(lab.vm_moref, si._stub)
@@ -268,13 +284,16 @@ class TestOpenvixdisklib:
 
                 blocks = handle.query_allocated_blocks(
                     disk,
-                    start_sector=(write_sector // chunk_size_sectors) * chunk_size_sectors,
+                    start_sector=(write_sector // chunk_size_sectors)
+                    * chunk_size_sectors,
                     num_sectors=chunk_size_sectors,
                     chunk_size_sectors=chunk_size_sectors,
                 )
                 assert any(
                     b.offset <= write_sector < b.offset + b.length for b in blocks
-                ), f"written sector {write_sector} on delta file not covered by {blocks}"
+                ), (
+                    f"written sector {write_sector} on delta file not covered by {blocks}"
+                )
         finally:
             try:
                 vm = vim.VirtualMachine(lab.vm_moref, si._stub)
@@ -284,6 +303,15 @@ class TestOpenvixdisklib:
                 Disconnect(si)
 
     @pytest.mark.parametrize(
+        "open_flags",
+        [
+            vixdisklib.VIXDISKLIB_FLAG_OPEN_COMPRESSION_FASTLZ,
+            vixdisklib.VIXDISKLIB_FLAG_OPEN_COMPRESSION_ZLIB,
+            vixdisklib.VIXDISKLIB_FLAG_OPEN_COMPRESSION_SKIPZ,
+        ],
+        ids=["fastlz", "zlib", "skipz"],
+    )
+    @pytest.mark.parametrize(
         "aio_buffer_size, n_sectors, n_fragments",
         [
             (nfc_open.NFC_AIO_BUFFER_SIZE, 128, 1),
@@ -292,16 +320,20 @@ class TestOpenvixdisklib:
         ],
         ids=["64kib-128s", "64kib-129s", "2mib-129s"],
     )
-    def test_skip_decompression_fastlz(
+    def test_skip_decompression(
         self,
         lab: LabEnv,
+        open_flags: int,
         aio_buffer_size: int,
         n_sectors: int,
         n_fragments: int,
     ) -> None:
-        """Pack FastLZ extras and rebuild the same bytes as a normal read."""
+        """Pack compressed extras and rebuild the same bytes as a normal read."""
         length = n_sectors * SECTOR_SIZE
-        expected = pattern_bytes(length, b"OVDL-SKIP-")
+        if open_flags == vixdisklib.VIXDISKLIB_FLAG_OPEN_COMPRESSION_SKIPZ:
+            expected = sparse_bytes(length, b"OVDL-SKIPZ-")
+        else:
+            expected = pattern_bytes(length, b"OVDL-SKIP-")
         handle = vixdisklib.VixDiskLibHandle(
             vixdisklib_compatibility_version="8.0", config_path=None
         )
@@ -312,13 +344,23 @@ class TestOpenvixdisklib:
         connect_kwargs = lab.vixdisklib_connect_kwargs(
             {"allow_untrusted": lab.allow_untrusted, "transport_modes": "nbd"}
         )
-        flags = vixdisklib.VIXDISKLIB_FLAG_OPEN_COMPRESSION_FASTLZ
+        expected_ctype = {
+            vixdisklib.VIXDISKLIB_FLAG_OPEN_COMPRESSION_FASTLZ: (
+                nfc_open.NFC_COMPRESSION_FASTLZ
+            ),
+            vixdisklib.VIXDISKLIB_FLAG_OPEN_COMPRESSION_ZLIB: (
+                nfc_open.NFC_COMPRESSION_ZLIB
+            ),
+            vixdisklib.VIXDISKLIB_FLAG_OPEN_COMPRESSION_SKIPZ: (
+                nfc_open.NFC_COMPRESSION_SKIPZ
+            ),
+        }[open_flags]
         with (
             handle.connect(**connect_kwargs) as conn,
             handle.open(
                 conn,
                 lab.disk_path,
-                flags=flags,
+                flags=open_flags,
                 aio_buffer_size=aio_buffer_size,
                 aio_buffer_count=1,
             ) as disk,
@@ -339,5 +381,8 @@ class TestOpenvixdisklib:
             assert dests == {0}
         else:
             assert dests == {0, nfc_open.NFC_AIO_BUFFER_SIZE}
+        assert any(
+            frag.compression_type == expected_ctype for frag in skip.fragments
+        ), f"expected a {expected_ctype} fragment, got {skip.fragments}"
         assert plain_buf.raw[:length] == expected
         assert _rebuild_skip(skip_buf, skip) == expected

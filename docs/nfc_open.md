@@ -261,14 +261,14 @@ Reply payload (60 bytes), fields that matter:
 
 | Offset | Type     | Meaning                         |
 | ------ | -------- | ------------------------------- |
-| 8      | `uint64` | File handle (opaque, per open)   |
-| 16     | `uint32` | File type (`2` = `NFC_DISK`)     |
-| 20     | `uint32` | Flags echoed (`0x1e` or `0x1a`)  |
-| 28     | `uint64` | Disk capacity in **bytes**       |
-| 36     | `uint32` | Sector size (`512` on this VM)   |
-| 40     | `uint32` | Physical geometry cylinders      |
-| 44     | `uint32` | Physical geometry heads          |
-| 48     | `uint32` | Physical geometry sectors        |
+| 8      | `uint64` | File handle (opaque, per open)  |
+| 16     | `uint32` | File type (`2` = `NFC_DISK`)    |
+| 20     | `uint32` | Flags echoed (`0x1e` or `0x1a`) |
+| 28     | `uint64` | Disk capacity in **bytes**      |
+| 36     | `uint32` | Sector size (`512` on this VM)  |
+| 40     | `uint32` | Physical geometry cylinders     |
+| 44     | `uint32` | Physical geometry heads         |
+| 48     | `uint32` | Physical geometry sectors       |
 
 Later AIO messages pass that handle as a `uint64`. Offset 28 was found
 by capturing `VixDiskLib_GetInfo` (Step 14,
@@ -319,7 +319,6 @@ I/O: `docs/nfc_read.md`, `docs/nfc_write.md`, and
 
 - zlib and skipz compression / encryption keys (`DDB_GET` is
   implemented for the plain, non-encrypted keys covered above)
-- change-block tracking
 - Host-switch (`NFC_AIO_SWITCH_HOST_*`)
 
 Reading/writing a snapshot delta file directly, and running
