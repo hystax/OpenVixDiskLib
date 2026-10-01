@@ -400,8 +400,14 @@ class VixDiskLibHandle:
         ``OPEN_FILE`` reply from ``open()``); ``bios_geo``/
         ``adapter_type``/``uuid`` cost 5 ``DDB_GET`` round trips, same
         as real VDDK pays on every ``GetInfo`` call. See
-        ``docs/nfc_open.md``.
+        ``docs/nfc_open.md``. HotAdd has no DDB channel; capacity comes
+        from the guest block device.
         """
+        if disk_handle.transport_mode == "hotadd":
+            info = disk_handle.disk.info
+            if info is None:
+                raise NotImplementedError("HotAdd disk has no capacity info")
+            return info
         return disk_handle.disk.query_full_info()
 
     def query_allocated_blocks(
@@ -420,6 +426,10 @@ class VixDiskLibHandle:
                 of ``chunk_size_sectors``.
             chunk_size_sectors: Minimum run granularity, in sectors.
         """
+        if disk_handle.transport_mode == "hotadd":
+            raise NotImplementedError(
+                "QueryAllocatedBlocks is not supported with hotadd"
+            )
         return disk_handle.disk.query_allocated_blocks(
             start_sector, num_sectors, chunk_size_sectors
         )
