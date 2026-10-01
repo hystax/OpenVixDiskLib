@@ -19,13 +19,13 @@ vSphere `ReconfigureVM` API (see `docs/hotadd.md`).
 ## Status
 
 Supported and tested on **vCenter 8 / ESXi 8** (lab: 8.0.1), including a
-standalone ESXi host with no vCenter. Linux guests can also use `hotadd`.
-The VixDiskLib compatibility mode is `8.0` only. VIM login requests
-pyVmomi's vim25 **8.x** versions, so a newer host such as vSphere 9 stays
-on 8.x SOAP instead of 9.x types.
+standalone ESXi host with no vCenter, and on ESXi 6.0, 6.5, 6.7, and 7
+for `nbd` and `nbdssl`. Linux guests can also use `hotadd`.
+The VixDiskLib compatibility mode argument remains `8.0`. VIM login lets
+the host pick its own vim25 version, so ESXi 6.x is not forced onto an
+8.x SOAP action.
 
-vSphere 9 is untested. vCenter / ESXi 7 and earlier are not supported at the
-moment.
+vSphere 9 is untested.
 
 Default transport is `nbdssl` (`nbd` is still available):
 

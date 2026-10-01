@@ -21,22 +21,36 @@ happened in ``nfc_auth``.
 
 from __future__ import annotations
 
+import logging
 import os
 import socket
 import ssl
 import struct
 import zlib
 from dataclasses import dataclass
-from typing import Protocol
 
 from openvixdisklib import fastlz
-from openvixdisklib.nfc_auth import NfcAuthSession, _ssl_client_context
+from openvixdisklib.nfc_auth import (
+    NfcAuthSession, _ssl_client_context)
+
+LOG = logging.getLogger(__name__)
 
 NFC_MSG_SIZE = 264
 NFC_AIO_MAGIC = 0xA100DA7A
 NFC_AIO_HDR_SIZE = 16
 NFC_SECTOR_SIZE = 512
 NFC_PROTOCOL_VERSION = 11
+# ESXi 8 (NFC library 11) starts the classic handshake with type 43
+# ``PlainText``. ESXi 6.7 and 7.0 answer that message with
+# SESSION_COMPLETE and close the session.
+NFC_PLAINTEXT_HANDSHAKE_VERSION = 11
+# VDDK 7.0.3 feature table: send a later classic or AIO message only
+# when the negotiated server version is at least this value.
+# CONNECTION_INFO is connection-data, ABORTABLE is session features,
+# RESOURCE_POOL is SET_RES_POOL.
+NFC_VERSION_CONNECTION_INFO = 3
+NFC_VERSION_ABORTABLE = 6
+NFC_VERSION_RESOURCE_POOL = 7
 # Max data bytes in one AIO IO request/reply fragment. Sent as
 # OPEN_SESSION ``bufSize`` (VDDK ``vixDiskLib.nfcAio.Session.BufSizeIn64KB``
 # times 64 KiB). ESXi read extras use this size; 2 MiB (32) works on
@@ -46,6 +60,11 @@ NFC_AIO_BUFFER_COUNT = 1
 
 # Classic NFC message types observed on the wire (uint32 at offset 0).
 NFC_MSG_SESSION_COMPLETE = 4
+NFC_MSG_ERROR = 20
+NFC_MSG_FSSRVR_OPEN = 21
+NFC_MSG_FSSRVR_DISKGEO = 22
+NFC_MSG_FSSRVR_IO = 23
+NFC_MSG_FSSRVR_CLOSE = 24
 NFC_MSG_SESSION_PARAMS = 33
 NFC_MSG_SESSION_PARAMS_REPLY = 36
 NFC_MSG_HANDSHAKE = 43
@@ -53,6 +72,18 @@ NFC_MSG_VERSION = 51
 NFC_MSG_AIO_SESSION_OPEN = 52
 NFC_MSG_CONNECTION_DATA = 54
 NFC_MSG_SESSION_FEATURES = 55
+# Session-params reply byte (message offset 16). Zero means the server
+# has no version message. ESXi 6.0 answers 0 and uses synchronous
+# fssrvr I/O. ESXi 6.5 and newer answer non-zero and continue with the
+# version message and AIO.
+NFC_SESSION_VERSION_FLAG = 12
+# Sentinel from ``_handshake`` when the server has no version message.
+NFC_FSSRVR_VERSION = -1
+# Largest fssrvr IO requested in one message. ESXi 6.0 accepts 4 MiB;
+# 1 MiB keeps each round trip modest.
+NFC_FSSRVR_IO_MAX = 1024 * 1024
+NFC_FSSRVR_IO_READ = 0
+NFC_FSSRVR_IO_WRITE = 1
 
 # SessionParams / feature bits from VDDK logs (interruption | switch).
 NFC_SESSION_FEATURE_INTERRUPTION_SWITCH = 3
@@ -91,45 +122,6 @@ NFC_COMPRESSION_NONE = 0
 NFC_COMPRESSION_ZLIB = 1
 NFC_COMPRESSION_FASTLZ = 2
 NFC_COMPRESSION_SKIPZ = 3
-
-
-@dataclass(frozen=True, slots=True)
-class DiskGeometry:
-    """CHS geometry, matching VDDK's ``VixDiskLibGeometry``."""
-
-    cylinders: int
-    heads: int
-    sectors: int
-
-
-@dataclass(frozen=True, slots=True)
-class AllocatedBlock:
-    """One allocated run, matching VDDK's ``VixDiskLibBlock`` (sectors)."""
-
-    offset: int
-    length: int
-
-
-@dataclass(frozen=True, slots=True)
-class DiskInfo:
-    """Matches VDDK's ``VixDiskLibInfo``.
-
-    ``phys_geo`` and ``capacity_sectors`` are read directly off
-    OPEN_FILE (offsets 40/44/48 and 28 respectively) — free, no extra
-    NFC round trip. ``bios_geo``, ``adapter_type``, and ``uuid`` come
-    from ``DDB_GET`` (see ``NfcDisk.ddb_get`` / ``query_full_info``,
-    ``docs/nfc_open.md``): each is a real round trip, matching what
-    real VDDK's ``VixDiskLib_GetInfo`` does. ``bios_geo`` defaults to
-    all zeros and ``adapter_type``/``uuid`` to ``None`` when the disk
-    has no snapshots or predates that DDB key (VDDK does the same for
-    a missing key).
-    """
-
-    capacity_sectors: int
-    phys_geo: DiskGeometry
-    bios_geo: DiskGeometry = DiskGeometry(cylinders=0, heads=0, sectors=0)
-    adapter_type: str | None = None
-    uuid: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,7 +230,9 @@ def takeover_authd_socket(ssock: ssl.SSLSocket) -> socket.socket:
     return raw
 
 
-def wrap_nfcssl_socket(ssock: ssl.SSLSocket, server_hostname: str) -> ssl.SSLSocket:
+def wrap_nfcssl_socket(
+    ssock: ssl.SSLSocket, server_hostname: str
+) -> ssl.SSLSocket:
     """Start the second TLS session used by NBDSSL after PROXY.
 
     After ``200 Connect ha-nfcssl``, authd TLS is finished and
@@ -251,7 +245,11 @@ def wrap_nfcssl_socket(ssock: ssl.SSLSocket, server_hostname: str) -> ssl.SSLSoc
         server_hostname: Host name passed to ``SSLContext.wrap_socket``.
     """
     raw = takeover_authd_socket(ssock)
-    ssl_context = _ssl_client_context(verify=False)
+    # ESXi 7 and 8 complete authd TLS with the default context, so this
+    # stays False and the second handshake is unchanged. ESXi 6.5 sets
+    # the flag when authd required the legacy cipher list.
+    legacy_tls = bool(getattr(ssock, "legacy_tls", False))
+    ssl_context = _ssl_client_context(verify=False, legacy=legacy_tls)
     try:
         return ssl_context.wrap_socket(raw, server_hostname=server_hostname)
     except Exception:
@@ -259,31 +257,18 @@ def wrap_nfcssl_socket(ssock: ssl.SSLSocket, server_hostname: str) -> ssl.SSLSoc
         raise
 
 
-class NfcTransport(Protocol):
-    """Byte pipe used after the NFC handshake (TCP, TLS, or a test fake)."""
-
-    def sendall(self, data: bytes) -> None:
-        """Send ``data`` in full."""
-
-    def recv_into(self, buffer: memoryview, nbytes: int = 0, flags: int = 0) -> int:
-        """Read into ``buffer`` and return the number of bytes stored."""
-
-    def close(self) -> None:
-        """Close the underlying connection."""
-
-
 def _enable_tcp_nodelay(sock: socket.socket) -> None:
     """Disable Nagle so a small AIO header is not held back from its extra."""
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
 
-def _recvn(sock: NfcTransport, size: int) -> bytes:
+def _recvn(sock: socket.socket, size: int) -> bytes:
     buf = bytearray(size)
     _recvn_into(sock, memoryview(buf))
     return bytes(buf)
 
 
-def _recvn_into(sock: NfcTransport, buf: memoryview) -> None:
+def _recvn_into(sock: socket.socket, buf: memoryview) -> None:
     """Read exactly ``len(buf)`` bytes into ``buf``."""
     view = buf.cast("B") if buf.format != "B" else buf
     filled = 0
@@ -381,7 +366,7 @@ def _skipz_decompress(extra: bytes, chunk_len: int) -> bytes:
     return bytes(out)
 
 
-def _send_nfc_msg(sock: NfcTransport, msg_type: int, body: bytes = b"") -> None:
+def _send_nfc_msg(sock: socket.socket, msg_type: int, body: bytes = b"") -> None:
     if len(body) > NFC_MSG_SIZE - 4:
         raise ValueError("NFC classic message body too large")
     frame = struct.pack("<I", msg_type) + body
@@ -414,7 +399,7 @@ class NfcDisk:
 
     def __init__(
         self,
-        sock: NfcTransport,
+        sock: socket.socket,
         path: str,
         handle: int,
         sector_size: int,
@@ -422,6 +407,7 @@ class NfcDisk:
         aio_buffer_size: int = NFC_AIO_BUFFER_SIZE,
         aio_buffer_count: int = NFC_AIO_BUFFER_COUNT,
         info: DiskInfo | None = None,
+        nfc_version: int | None = None,
     ) -> None:
         """Wrap an AIO session that already has ``path`` open.
 
@@ -440,6 +426,7 @@ class NfcDisk:
                 ``NFC_AIO_BUFFER_COUNT``).
             info: Capacity/geometry from the OPEN_FILE reply. ``None``
                 before the reply arrives.
+            nfc_version: NFC protocol version the server agreed to.
         """
         self._sock = sock
         self._op_id = 0
@@ -450,6 +437,7 @@ class NfcDisk:
         self.aio_buffer_size = aio_buffer_size
         self.aio_buffer_count = aio_buffer_count
         self.info = info
+        self.nfc_version = nfc_version
         self._closed = False
 
     def _next_op_id(self) -> int:
@@ -874,16 +862,59 @@ class NfcDisk:
         self.close()
 
 
-def _handshake(sock: socket.socket, client_name: str, op_id: str, version: int) -> None:
-    """Run the classic NFC session handshake used by VDDK NBD."""
-    _send_nfc_msg(sock, NFC_MSG_HANDSHAKE, b"PlainText")
+def _handshake(
+    sock: socket.socket,
+    client_name: str,
+    op_id: str,
+    version: int,
+    server_nfc_version: int | None = None,
+) -> int:
+    """Run the classic NFC session handshake used by VDDK NBD.
+
+    Returns the NFC protocol version the server agreed to.
+    ``NFC_FSSRVR_VERSION`` means the server has no version message
+    (ESXi 6.0); the caller opens the disk with synchronous fssrvr I/O
+    and does not send an AIO session.
+
+    Args:
+        sock: NFC socket after authd PROXY.
+        client_name: NFC client name; VDDK sends ``vddk``.
+        op_id: NFC operation id; VDDK NBD sends ``nbdmode``.
+        version: Client NFC protocol version to advertise.
+        server_nfc_version: ``NfcGetServerNfcLibVersion``. ``None`` and
+            values at or above ``NFC_PLAINTEXT_HANDSHAKE_VERSION`` send
+            the ESXi 8 type-43 ``PlainText`` handshake. Older libraries
+            reject that message, so it is skipped.
+    """
+    if (
+        server_nfc_version is None
+        or server_nfc_version >= NFC_PLAINTEXT_HANDSHAKE_VERSION
+    ):
+        _send_nfc_msg(sock, NFC_MSG_HANDSHAKE, b"PlainText")
+    else:
+        LOG.info(
+            "Skipping NFC PlainText handshake for server library %s",
+            server_nfc_version,
+        )
     _send_nfc_msg(sock, NFC_MSG_SESSION_PARAMS)
-    reply_type, _ = _recv_nfc_msg(sock)
+    reply_type, reply_body = _recv_nfc_msg(sock)
     if reply_type != NFC_MSG_SESSION_PARAMS_REPLY:
         raise NfcProtocolError(
             f"expected session-params reply {NFC_MSG_SESSION_PARAMS_REPLY}, "
             f"got {reply_type}"
         )
+    # VDDK reads this byte and skips the version message when it is 0.
+    # ESXi 6.0 is 0. ESXi 6.5 and newer set it, so they still negotiate
+    # a version and open an AIO session.
+    if (
+        len(reply_body) <= NFC_SESSION_VERSION_FLAG
+        or reply_body[NFC_SESSION_VERSION_FLAG] == 0
+    ):
+        LOG.info(
+            "Server does not support the NFC version message; "
+            "using synchronous fssrvr I/O"
+        )
+        return NFC_FSSRVR_VERSION
 
     _send_nfc_msg(sock, NFC_MSG_VERSION, struct.pack("<I", version))
     reply_type, body = _recv_nfc_msg(sock)
@@ -892,30 +923,46 @@ def _handshake(sock: socket.socket, client_name: str, op_id: str, version: int) 
             f"expected version reply {NFC_MSG_VERSION}, got {reply_type}"
         )
     remote_version = struct.unpack_from("<I", body)[0]
-    if remote_version < 3:
-        raise NfcProtocolError(
-            f"NFC server version {remote_version} is too old for AIO"
+    LOG.info(
+        "NFC version negotiation: client %s, server %s",
+        version, remote_version)
+    # Connection-data needs CONNECTION_INFO (version >= 3). Session
+    # features need ABORTABLE (version >= 6). ESXi 6.5 answers 0 and
+    # ESXi 6.7 answers 2, so both skip those messages. ESXi 7 and 8
+    # answer >= 7 and still receive both.
+    if remote_version < NFC_VERSION_CONNECTION_INFO:
+        LOG.info(
+            "Skipping NFC connection data for server version %s",
+            remote_version,
         )
-
-    name_b = client_name.encode("ascii")
-    op_b = op_id.encode("ascii")
-    _send_nfc_msg(
-        sock, NFC_MSG_CONNECTION_DATA, struct.pack("<II", len(name_b), len(op_b))
-    )
-    sock.sendall(name_b)
-    sock.sendall(op_b)
-    _send_nfc_msg(
-        sock,
-        NFC_MSG_SESSION_FEATURES,
-        struct.pack("<I", NFC_SESSION_FEATURE_INTERRUPTION_SWITCH),
-    )
+    else:
+        name_b = client_name.encode("ascii")
+        op_b = op_id.encode("ascii")
+        _send_nfc_msg(
+            sock, NFC_MSG_CONNECTION_DATA, struct.pack("<II", len(name_b), len(op_b))
+        )
+        sock.sendall(name_b)
+        sock.sendall(op_b)
+        if remote_version < NFC_VERSION_ABORTABLE:
+            LOG.info(
+                "Skipping NFC session features for server version %s",
+                remote_version,
+            )
+        else:
+            _send_nfc_msg(
+                sock,
+                NFC_MSG_SESSION_FEATURES,
+                struct.pack("<I", NFC_SESSION_FEATURE_INTERRUPTION_SWITCH),
+            )
     _send_nfc_msg(sock, NFC_MSG_AIO_SESSION_OPEN)
     reply_type, _ = _recv_nfc_msg(sock)
     if reply_type != NFC_MSG_AIO_SESSION_OPEN:
         raise NfcProtocolError(
             f"expected AIO session-open reply "
-            f"{NFC_MSG_AIO_SESSION_OPEN}, got {reply_type}"
+            f"{NFC_MSG_AIO_SESSION_OPEN}, got {reply_type} "
+            f"(NFC client version {version}, server version {remote_version})"
         )
+    return remote_version
 
 
 def _aio_prepare(disk: NfcDisk) -> None:
@@ -924,7 +971,11 @@ def _aio_prepare(disk: NfcDisk) -> None:
     )
     disk._aio_roundtrip(NFC_AIO_MSG_OPEN_SESSION, open_session)
     disk._aio_roundtrip(NFC_AIO_MSG_SET_SOCK_OPTS, bytes(12))
-    disk._aio_roundtrip(NFC_AIO_MSG_SET_RES_POOL, struct.pack("<I", 1))
+    # RESOURCE_POOL is NFC version >= 7. ESXi 6.5 (version 0) and
+    # ESXi 6.7 (version 2) are not sent SET_RES_POOL. ESXi 7 and 8
+    # report a version >= 7 and still receive it.
+    if disk.nfc_version >= NFC_VERSION_RESOURCE_POOL:
+        disk._aio_roundtrip(NFC_AIO_MSG_SET_RES_POOL, struct.pack("<I", 1))
 
 
 def _decode_allocated_bitmap(
@@ -974,24 +1025,242 @@ def _parse_open_reply(body: bytes) -> tuple[int, int, DiskInfo]:
     return handle, sector_size, info
 
 
+def _fssrvr_expect(sock: socket.socket, expected: int) -> bytes:
+    """Read one classic NFC reply and raise on ``NFC_MSG_ERROR``."""
+    reply_type, body = _recv_nfc_msg(sock)
+    if reply_type == NFC_MSG_ERROR:
+        text = bytearray()
+        while len(text) < 512:
+            chunk = sock.recv(1)
+            if not chunk or chunk == b"\x00":
+                break
+            text += chunk
+        message = text.decode("ascii", "replace") or body[:16].hex()
+        raise NfcProtocolError(f"NFC fssrvr error: {message}")
+    if reply_type != expected:
+        raise NfcProtocolError(
+            f"expected fssrvr reply {expected}, got {reply_type}"
+        )
+    return body
+
+
+def _parse_fssrvr_geometry(body: bytes) -> tuple[int, DiskInfo]:
+    """Parse an ``NFC_FSSRVR_DISKGEO`` reply into sector size and info."""
+    frame = struct.pack("<I", NFC_MSG_FSSRVR_DISKGEO) + body
+    if len(frame) < 28:
+        raise NfcProtocolError("fssrvr disk geometry reply is too short")
+    capacity_bytes = struct.unpack_from("<q", frame, 4)[0]
+    sector_size = struct.unpack_from("<I", frame, 12)[0] or NFC_SECTOR_SIZE
+    cylinders, heads, sectors = struct.unpack_from("<III", frame, 16)
+    if capacity_bytes < 0:
+        raise NfcProtocolError(f"fssrvr disk size {capacity_bytes} is invalid")
+    info = DiskInfo(
+        capacity_sectors=capacity_bytes // sector_size,
+        phys_geo=DiskGeometry(cylinders=cylinders, heads=heads, sectors=sectors),
+    )
+    return sector_size, info
+
+
+class FssrvrDisk:
+    """Synchronous NFC file I/O for hosts that have no AIO session.
+
+    ESXi 6.0 answers the session-params message with the version flag
+    clear, rejects ``NFC_AIO_SESSION_OPEN``, and transfers the VMDK with
+    ``NFC_FSSRVR_OPEN`` / ``NFC_FSSRVR_IO`` / ``NFC_FSSRVR_CLOSE``.
+    """
+
+    def __init__(
+        self,
+        sock: socket.socket,
+        path: str,
+        sector_size: int,
+        info: DiskInfo,
+    ) -> None:
+        """Wrap a VMDK already opened with ``NFC_FSSRVR_OPEN``.
+
+        Args:
+            sock: NFC socket after the fssrvr open reply.
+            path: Datastore path that was opened.
+            sector_size: Sector size from the disk-geometry reply.
+            info: Capacity and physical geometry from that reply.
+        """
+        self._sock = sock
+        self.path = path
+        self.handle = 0
+        self.sector_size = sector_size
+        self.compression = NFC_COMPRESSION_NONE
+        self.info = info
+        self.nfc_version = None
+        self._closed = False
+
+    def read(self, start_sector: int, num_sectors: int = 1) -> bytes:
+        """Read ``num_sectors`` starting at ``start_sector``.
+
+        Args:
+            start_sector: Sector offset from the start of the disk.
+            num_sectors: Number of sectors to read.
+        """
+        if num_sectors < 1:
+            raise ValueError("num_sectors must be at least 1")
+        buf = bytearray(num_sectors * self.sector_size)
+        self.readinto(start_sector, num_sectors, buf)
+        return bytes(buf)
+
+    def readinto(
+        self,
+        start_sector: int,
+        num_sectors: int,
+        buf: bytearray | memoryview,
+        skip_decompression: bool = False,
+    ) -> ReadResult:
+        """Read ``num_sectors`` into ``buf`` starting at ``start_sector``.
+
+        Args:
+            start_sector: Sector offset from the start of the disk.
+            num_sectors: Number of sectors to read.
+            buf: Destination buffer.
+            skip_decompression: Accepted for the shared read API. This
+                path has no compressed extras.
+
+        Returns:
+            Lengths of the request. ``fragments`` is empty.
+        """
+        del skip_decompression
+        if num_sectors < 1:
+            raise ValueError("num_sectors must be at least 1")
+        length = num_sectors * self.sector_size
+        data = _writable_bytes(buf, length)
+        offset = start_sector * self.sector_size
+        filled = 0
+        while filled < length:
+            chunk = min(NFC_FSSRVR_IO_MAX, length - filled)
+            self._io(NFC_FSSRVR_IO_READ, offset + filled, chunk, data[filled:filled + chunk])
+            filled += chunk
+        return ReadResult(
+            uncompressed_length=length,
+            compressed_length=length,
+            fragments=(),
+        )
+
+    def write(self, start_sector: int, num_sectors: int, data: bytes) -> None:
+        """Write ``num_sectors`` starting at ``start_sector``.
+
+        Args:
+            start_sector: Sector offset from the start of the disk.
+            num_sectors: Number of sectors to write.
+            data: Bytes to write; length must be ``num_sectors * sector_size``.
+        """
+        if num_sectors < 1:
+            raise ValueError("num_sectors must be at least 1")
+        length = num_sectors * self.sector_size
+        if len(data) != length:
+            raise ValueError(f"write data is {len(data)} bytes, need {length}")
+        offset = start_sector * self.sector_size
+        filled = 0
+        while filled < length:
+            chunk = min(NFC_FSSRVR_IO_MAX, length - filled)
+            self._io(
+                NFC_FSSRVR_IO_WRITE,
+                offset + filled,
+                chunk,
+                data[filled:filled + chunk],
+            )
+            filled += chunk
+
+    def query_full_info(self) -> DiskInfo:
+        """Return capacity and physical geometry from the open reply.
+
+        ESXi 6.0 does not serve the AIO DDB keys used on newer hosts,
+        so BIOS geometry, adapter type, and UUID stay unset.
+        """
+        if self.info is None:
+            raise NfcProtocolError("fssrvr disk has no geometry")
+        return self.info
+
+    def query_allocated_blocks(
+        self,
+        start_sector: int,
+        num_sectors: int,
+        chunk_size_sectors: int,
+    ) -> tuple[AllocatedBlock, ...]:
+        """Allocated-block query is not available on the fssrvr path."""
+        del start_sector, num_sectors, chunk_size_sectors
+        raise NotImplementedError(
+            "QueryAllocatedBlocks is not supported on this host"
+        )
+
+    def close(self) -> None:
+        """Close the VMDK and the classic NFC session."""
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            _send_nfc_msg(self._sock, NFC_MSG_FSSRVR_CLOSE)
+            _fssrvr_expect(self._sock, NFC_MSG_FSSRVR_CLOSE)
+            _send_nfc_msg(self._sock, NFC_MSG_SESSION_COMPLETE)
+        finally:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+
+    def _io(self, direction: int, offset: int, length: int, buf: memoryview | bytes) -> None:
+        payload = struct.pack("<B", direction) + b"\x00\x00\x00" + struct.pack("<QI", offset, length)
+        _send_nfc_msg(self._sock, NFC_MSG_FSSRVR_IO, payload)
+        if direction == NFC_FSSRVR_IO_WRITE:
+            self._sock.sendall(buf)
+        _fssrvr_expect(self._sock, NFC_MSG_FSSRVR_IO)
+        if direction == NFC_FSSRVR_IO_READ:
+            _recvn_into(self._sock, buf)
+
+    def __enter__(self) -> FssrvrDisk:
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+
+def _open_fssrvr_disk(
+    sock: socket.socket, disk_path: str, read_only: bool
+) -> FssrvrDisk:
+    """Open ``disk_path`` with ``NFC_FSSRVR_OPEN`` and return the disk."""
+    path_b = disk_path.encode("utf-8") + b"\x00"
+    open_flags = (
+        NFC_OPEN_FLAGS_READ_ONLY if read_only else NFC_OPEN_FLAGS_READ_WRITE
+    )
+    _send_nfc_msg(sock, NFC_MSG_FSSRVR_OPEN, struct.pack("<II", len(path_b), open_flags))
+    sock.sendall(path_b)
+    geo = _fssrvr_expect(sock, NFC_MSG_FSSRVR_DISKGEO)
+    sector_size, info = _parse_fssrvr_geometry(geo)
+    LOG.info(
+        "Opened %s via fssrvr (%s bytes, sector %s)",
+        disk_path, info.capacity_sectors * sector_size, sector_size,
+    )
+    return FssrvrDisk(sock, disk_path, sector_size, info)
+
+
 def open_disk(
     session: NfcAuthSession,
     disk_path: str,
     client_name: str = "vddk",
     op_id: str = "nbdmode",
     version: int = NFC_PROTOCOL_VERSION,
+    server_nfc_version: int | None = None,
+    server_hostname: str | None = None,
     read_only: bool = True,
     compression: int = NFC_COMPRESSION_NONE,
     aio_buffer_size: int = NFC_AIO_BUFFER_SIZE,
     aio_buffer_count: int = NFC_AIO_BUFFER_COUNT,
-) -> NfcDisk:
+) -> NfcDisk | FssrvrDisk:
     """Open ``disk_path`` over the authenticated authd socket.
 
     Matches VDDK ``VixDiskLib_Open`` of a datastore path after the NFC
     ticket and authd PROXY handshake: session init, AIO open, then
-    ``NFC_AIO_MSG_OPEN_FILE`` with type ``NFC_DISK``. NBD dups the
-    authd fd and sends plaintext NFC. NBDSSL wraps that dup in a
-    second TLS session (``session.nfc_ssl``).
+    ``NFC_AIO_MSG_OPEN_FILE`` with type ``NFC_DISK``. A host that does
+    not support the version message (ESXi 6.0) is opened with
+    synchronous fssrvr messages instead. NBD dups the authd fd and
+    sends plaintext NFC. NBDSSL wraps that dup in a second TLS session
+    (``session.nfc_ssl``).
 
     Args:
         session: Result of ``nfc_auth.authenticate``.
@@ -999,7 +1268,13 @@ def open_disk(
             ``[datastore0] vm/vm.vmdk``.
         client_name: NFC client name; VDDK sends ``vddk``.
         op_id: NFC operation id; VDDK NBD sends ``nbdmode``.
-        version: Client NFC protocol version (lab ESXi answered 11).
+        version: Client NFC protocol version (lab ESXi 8 answered 11).
+        server_nfc_version: Host NFC library from
+            ``NfcGetServerNfcLibVersion``. Selects the classic
+            handshake. ``None`` keeps the ESXi 8 ``PlainText`` message.
+        server_hostname: Name for the NBDSSL second TLS handshake.
+            A direct ESXi ticket leaves ``ticket.host`` empty; pass the
+            VIM host in that case. ``None`` uses ``ticket.host``.
         read_only: When True, open with VDDK's read-only NFC flags.
         compression: ``NFC_COMPRESSION_NONE``, ``NFC_COMPRESSION_ZLIB``,
             ``NFC_COMPRESSION_FASTLZ``, or ``NFC_COMPRESSION_SKIPZ``.
@@ -1022,11 +1297,21 @@ def open_disk(
         )
     sock: socket.socket
     if session.nfc_ssl:
-        sock = wrap_nfcssl_socket(session.authd_sock, session.ticket.host)
+        sock = wrap_nfcssl_socket(
+            session.authd_sock, server_hostname or session.ticket.host
+        )
     else:
         sock = takeover_authd_socket(session.authd_sock)
     try:
-        _handshake(sock, client_name, op_id, version)
+        negotiated = _handshake(
+            sock, client_name, op_id, version, server_nfc_version=server_nfc_version
+        )
+        if negotiated == NFC_FSSRVR_VERSION:
+            if compression != NFC_COMPRESSION_NONE:
+                raise NotImplementedError(
+                    "NFC compression is not supported on this host"
+                )
+            return _open_fssrvr_disk(sock, disk_path, read_only=read_only)
         disk = NfcDisk(
             sock,
             disk_path,
@@ -1035,6 +1320,7 @@ def open_disk(
             compression=compression,
             aio_buffer_size=aio_buffer_size,
             aio_buffer_count=aio_buffer_count,
+            nfc_version=negotiated,
         )
         _aio_prepare(disk)
         path_b = disk_path.encode("utf-8")

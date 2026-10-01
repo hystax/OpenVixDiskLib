@@ -147,7 +147,7 @@ class _DiskHandle:
 
     def __init__(
         self,
-        disk: nfc_open.NfcDisk | hotadd.HotAddDisk,
+        disk: nfc_open.NfcDisk | nfc_open.FssrvrDisk | hotadd.HotAddDisk,
         transport_mode: str,
         authd_sock=None,
     ) -> None:
@@ -295,6 +295,7 @@ class VixDiskLibHandle:
         flags: int = VIXDISKLIB_FLAG_OPEN_READ_ONLY,
         aio_buffer_size: int = nfc_open.NFC_AIO_BUFFER_SIZE,
         aio_buffer_count: int = nfc_open.NFC_AIO_BUFFER_COUNT,
+        nfc_version: int | None = None,
     ) -> Iterator[_DiskHandle]:
         """Open ``disk_path`` over NFC or HotAdd. Matches ``VixDiskLib_Open``.
 
@@ -322,6 +323,10 @@ class VixDiskLibHandle:
                 for HotAdd.
             aio_buffer_count: NFC AIO buffer pool count. Default 1.
                 VDDK's default is 4. Ignored for HotAdd.
+            nfc_version: NFC protocol version advertised to the host.
+                ``None`` uses ``NFC_PROTOCOL_VERSION`` (11). The host
+                replies with the version it will use. ESXi 6.0 does not
+                answer that message and is opened with fssrvr I/O.
         """
         LOG.debug("Openning VixDiskLib disk: %s", disk_path)
         compression = _nfc_compression(flags)
@@ -350,6 +355,7 @@ class VixDiskLibHandle:
             return
 
         nfc_ssl = conn.transport_mode == "nbdssl"
+        fallback_host = conn.si._stub.host.rsplit(":", 1)[0]
         ticket = nfc_auth.get_nfc_ticket(
             conn.si, vm, read_only=read_only, disk_path=None if read_only else disk_path
         )
@@ -357,7 +363,7 @@ class VixDiskLibHandle:
             ticket,
             allow_untrusted=conn.allow_untrusted,
             nfc_ssl=nfc_ssl,
-            fallback_host=conn.si._stub.host.rsplit(":", 1)[0],
+            fallback_host=fallback_host,
         )
         session = nfc_auth.NfcAuthSession(conn.si, ticket, authd_sock, nfc_ssl=nfc_ssl)
         try:
@@ -368,6 +374,15 @@ class VixDiskLibHandle:
                 compression=compression,
                 aio_buffer_size=aio_buffer_size,
                 aio_buffer_count=aio_buffer_count,
+                version=(
+                    nfc_version
+                    if nfc_version is not None
+                    else nfc_open.NFC_PROTOCOL_VERSION
+                ),
+                server_nfc_version=nfc_auth.server_nfc_lib_version(
+                    conn.si, vm.runtime.host
+                ),
+                server_hostname=ticket.host or fallback_host,
             )
         except Exception:
             authd_sock.close()
