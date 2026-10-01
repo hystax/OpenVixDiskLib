@@ -13,6 +13,7 @@ from openvixdisklib import fastlz, nfc_open
 from openvixdisklib import openvixdisklib as vixdisklib
 from openvixdisklib.openvixdisklib import ReadResult
 from tests.integration.base import (
+    _DISK_CAPACITY_KB,
     SECTOR_AT_1GB,
     SECTOR_SIZE,
     LabEnv,
@@ -94,14 +95,33 @@ class TestOpenvixdisklib:
                 handle.read(disk, start, 1, read_buf)
                 assert read_buf.raw[:SECTOR_SIZE] == expected
 
-    def test_query_allocated_blocks(self, lab: LabEnv) -> None:
-        """A written sector's chunk shows up as an allocated run.
+    def test_get_info(self, lab: LabEnv) -> None:
+        """get_info returns the lab VM's known disk capacity and geometry."""
+        handle = vixdisklib.VixDiskLibHandle(vixdisklib_compatibility_version="8.0")
+        connect_kwargs = lab.vixdisklib_connect_kwargs(
+            {"allow_untrusted": lab.allow_untrusted, "read_only": True}
+        )
+        with (
+            handle.connect(**connect_kwargs) as conn,
+            handle.open(
+                conn, lab.disk_path, flags=vixdisklib.VIXDISKLIB_FLAG_OPEN_READ_ONLY
+            ) as disk,
+        ):
+            info = handle.get_info(disk)
+            assert info.capacity_sectors == _DISK_CAPACITY_KB * 1024 // SECTOR_SIZE
+            assert info.phys_geo.cylinders > 0
+            assert info.phys_geo.heads > 0
+            assert info.phys_geo.sectors > 0
+            # bios_geo is DDB-derived and unset (all zero) on a disk with
+            # no snapshots yet, matching VDDK's own default for a missing key.
+            assert info.bios_geo == vixdisklib.DiskGeometry(
+                cylinders=0, heads=0, sectors=0
+            )
+            assert info.adapter_type  # non-empty DDB string, e.g. "lsilogic"
+            assert info.uuid  # non-empty DDB string
 
-        Write and query use separate handles (write closed first): see
-        docs/nfc_read.md's gotcha -- querying on the same still-open
-        handle a write just went through can see stale (pre-write)
-        data.
-        """
+    def test_query_allocated_blocks(self, lab: LabEnv) -> None:
+        """A written sector's chunk shows up as an allocated run."""
         handle = vixdisklib.VixDiskLibHandle(vixdisklib_compatibility_version="8.0")
         chunk_size_sectors = 128
         # Chunk-aligned offset away from what other tests in this shared
@@ -117,11 +137,6 @@ class TestOpenvixdisklib:
             handle.open(conn, lab.disk_path, flags=0) as disk,
         ):
             handle.write(disk, write_sector, 1, write_buf)
-
-        with (
-            handle.connect(**connect_kwargs) as conn,
-            handle.open(conn, lab.disk_path, flags=0) as disk,
-        ):
             blocks = handle.query_allocated_blocks(
                 disk,
                 start_sector=(write_sector // chunk_size_sectors) * chunk_size_sectors,
@@ -228,12 +243,7 @@ class TestOpenvixdisklib:
         read_buf = vixdisklib.get_buffer(SECTOR_SIZE)
 
         si = _connect_vim(
-            lab.host,
-            lab.username,
-            lab.password,
-            lab.port,
-            lab.thumbprint,
-            lab.allow_untrusted,
+            lab.host, lab.username, lab.password, lab.port, lab.thumbprint, lab.allow_untrusted
         )
         try:
             vm = vim.VirtualMachine(lab.vm_moref, si._stub)
@@ -258,17 +268,13 @@ class TestOpenvixdisklib:
 
                 blocks = handle.query_allocated_blocks(
                     disk,
-                    start_sector=(write_sector // chunk_size_sectors)
-                    * chunk_size_sectors,
+                    start_sector=(write_sector // chunk_size_sectors) * chunk_size_sectors,
                     num_sectors=chunk_size_sectors,
                     chunk_size_sectors=chunk_size_sectors,
                 )
                 assert any(
                     b.offset <= write_sector < b.offset + b.length for b in blocks
-                ), (
-                    f"written sector {write_sector} "
-                    f"on delta file not covered by {blocks}"
-                )
+                ), f"written sector {write_sector} on delta file not covered by {blocks}"
         finally:
             try:
                 vm = vim.VirtualMachine(lab.vm_moref, si._stub)

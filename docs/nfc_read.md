@@ -267,4 +267,3 @@ and expect it to reflect that write.
 
 - zlib and skipz NBD compression flags
 - `VixDiskLib_ReadAsync` (same IO messages, different client threading)
-- `VixDiskLib_GetInfo` capacity (not required to read a known range)

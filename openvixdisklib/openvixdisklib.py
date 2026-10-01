@@ -28,6 +28,8 @@ from openvixdisklib import nfc_auth, nfc_open
 
 ReadResult = nfc_open.ReadResult
 ReadFragment = nfc_open.ReadFragment
+DiskInfo = nfc_open.DiskInfo
+DiskGeometry = nfc_open.DiskGeometry
 AllocatedBlock = nfc_open.AllocatedBlock
 
 LOG = logging.getLogger(__name__)
@@ -306,7 +308,10 @@ class VixDiskLibHandle:
             conn.si, vm, read_only=read_only, disk_path=None if read_only else disk_path
         )
         authd_sock = nfc_auth.connect_authd(
-            ticket, allow_untrusted=conn.allow_untrusted, nfc_ssl=nfc_ssl
+            ticket,
+            allow_untrusted=conn.allow_untrusted,
+            nfc_ssl=nfc_ssl,
+            fallback_host=conn.si._stub.host.rsplit(":", 1)[0],
         )
         session = nfc_auth.NfcAuthSession(conn.si, ticket, authd_sock, nfc_ssl=nfc_ssl)
         try:
@@ -326,6 +331,17 @@ class VixDiskLibHandle:
             yield handle
         finally:
             self.close(handle)
+
+    def get_info(self, disk_handle: _DiskHandle) -> nfc_open.DiskInfo:
+        """Return disk info. Matches ``VixDiskLib_GetInfo``.
+
+        ``capacity_sectors``/``phys_geo`` are free (already in the
+        ``OPEN_FILE`` reply from ``open()``); ``bios_geo``/
+        ``adapter_type``/``uuid`` cost 5 ``DDB_GET`` round trips, same
+        as real VDDK pays on every ``GetInfo`` call. See
+        ``docs/nfc_open.md``.
+        """
+        return disk_handle.disk.query_full_info()
 
     def query_allocated_blocks(
         self,
