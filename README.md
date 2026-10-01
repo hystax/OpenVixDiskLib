@@ -18,20 +18,42 @@ vSphere `ReconfigureVM` API (see `docs/hotadd.md`).
 
 ## Status
 
-Implemented against vCenter 8 / ESXi 8. Default transport is `nbdssl`
-(`nbd` is still available). Linux guests can also use `hotadd`:
+Supported and tested on **vCenter 8 / ESXi 8** (lab: 8.0.1), including a
+standalone ESXi host with no vCenter. Linux guests can also use `hotadd`.
+The VixDiskLib compatibility mode is `8.0` only. VIM login requests
+pyVmomi's vim25 **8.x** versions, so a newer host such as vSphere 9 stays
+on 8.x SOAP instead of 9.x types.
 
-- `VixDiskLib_ConnectEx` (UID credentials)
+vSphere 9 is untested. vCenter / ESXi 7 and earlier are not supported at the
+moment.
+
+Default transport is `nbdssl` (`nbd` is still available):
+
+- `VixDiskLib_ConnectEx` (UID credentials; vCenter or direct ESXi)
 - `VixDiskLib_Open` (datastore path, read-only or read-write)
-- `VixDiskLib_Read` (optional ``skip_decompression`` packs FastLZ extras)
+- `VixDiskLib_Read` (optional ``skip_decompression`` packs compressed
+  extras as-is, whichever algorithm the disk was opened with)
 - `VixDiskLib_Write`
+- `VixDiskLib_GetInfo` (capacity and physical geometry from the `Open`
+  reply; `biosGeo`/`adapterType`/`uuid` from `DDB_GET`, matching real
+  VDDK's cost and behavior)
+- `VixDiskLib_QueryAllocatedBlocks` (allocated-block bitmap; see
+  `docs/nfc_read.md`)
+- Changed Block Tracking: `openvixdisklib.nfc_auth.enable_change_tracking`
+  / `disk_change_id` / `query_changed_disk_areas` (public VIM API, not
+  part of VixDiskLib itself; see `docs/cbt.md`)
+- NBD IO compression: zlib, FastLZ, and SkipZ (`VIXDISKLIB_FLAG_OPEN_COMPRESSION_{ZLIB,FASTLZ,SKIPZ}`;
+  see `docs/nfc_read.md`)
 - HotAdd on a Linux VMware guest (SCSI, NVMe, or SATA source disks,
   attached onto a proxy SCSI controller)
 
-Not implemented: compression open flags other than FastLZ, CBT /
-allocated-block queries, disk geometry (`DDB_GET`), encrypted disks,
-direct ESXi `ha-nfc` without vCenter `vpxa-nfc`, SAN / file transports,
-Windows HotAdd, and HotAdd onto a proxy NVMe controller.
+Reading/writing a snapshot delta file directly (and running
+`query_allocated_blocks` against it) already works — `NFC_DELTA_DISK`
+turned out to be an optional VMFS-only VDDK client optimization, not a
+correctness requirement (see `docs/reverse_engineering_procedure.md`).
+
+Not implemented: encrypted disks, SAN / file transports, Windows HotAdd,
+and HotAdd onto a proxy NVMe controller.
 
 Requires Python 3.10 or later.
 
@@ -101,6 +123,9 @@ password: secret
 allow_untrusted: true
 datacenter: Datacenter
 datastore: datastore0
+esxi:
+  username: root
+  password: secret
 hotadd_proxy:
   host: hotadd-proxy.example.com
   user: root
@@ -108,9 +133,12 @@ hotadd_proxy:
 
 A session-scoped pytest fixture creates an empty VM with a 10 GiB thin
 disk on that datastore and tears it down when the session ends. Tests
-write known patterns and read them back. HotAdd tests SSH into
-`hotadd_proxy` (a Linux guest on the same datastore) and skip if SSH
-fails.
+write known patterns and read them back. Direct-ESXi tests pick the lab
+VM's host from vCenter and log into hostd (default ``root`` and the
+vCenter password) so NFC uses ``ha-nfc-service`` instead of
+``nfcService``. They skip when lockdown is on or hostd login fails.
+HotAdd tests SSH into `hotadd_proxy` (a Linux guest on the same
+datastore) and skip if SSH fails.
 
 ```bash
 tox -e integration
