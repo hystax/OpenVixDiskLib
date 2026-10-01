@@ -133,6 +133,45 @@ class DiskInfo:
 
 
 @dataclass(frozen=True, slots=True)
+class DiskGeometry:
+    """CHS geometry, matching VDDK's ``VixDiskLibGeometry``."""
+
+    cylinders: int
+    heads: int
+    sectors: int
+
+
+@dataclass(frozen=True, slots=True)
+class AllocatedBlock:
+    """One allocated run, matching VDDK's ``VixDiskLibBlock`` (sectors)."""
+
+    offset: int
+    length: int
+
+
+@dataclass(frozen=True, slots=True)
+class DiskInfo:
+    """Matches VDDK's ``VixDiskLibInfo``.
+
+    ``phys_geo`` and ``capacity_sectors`` are read directly off
+    OPEN_FILE (offsets 40/44/48 and 28 respectively) — free, no extra
+    NFC round trip. ``bios_geo``, ``adapter_type``, and ``uuid`` come
+    from ``DDB_GET`` (see ``NfcDisk.ddb_get`` / ``query_full_info``,
+    ``docs/nfc_open.md``): each is a real round trip, matching what
+    real VDDK's ``VixDiskLib_GetInfo`` does. ``bios_geo`` defaults to
+    all zeros and ``adapter_type``/``uuid`` to ``None`` when the disk
+    has no snapshots or predates that DDB key (VDDK does the same for
+    a missing key).
+    """
+
+    capacity_sectors: int
+    phys_geo: DiskGeometry
+    bios_geo: DiskGeometry = DiskGeometry(cylinders=0, heads=0, sectors=0)
+    adapter_type: str | None = None
+    uuid: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class ReadFragment:
     """One NFC AIO extra in a packed skip-decompression ``buf``.
 
