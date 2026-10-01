@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import logging
 import re
 import socket
 import ssl
@@ -27,27 +28,36 @@ import types
 from dataclasses import dataclass
 
 from pyVim.connect import Disconnect, SmartConnect
-from pyVmomi import vim
-from pyVmomi.VmomiSupport import (
-    F_OPTIONAL,
-    CreateManagedType,
-    GetServiceVersions,
-    GetVmodlType,
-)
+from pyVmomi import vim, vmodl
+from pyVmomi.VmomiSupport import F_OPTIONAL, CreateManagedType, GetVmodlType
 
 AUTHD_DEFAULT_PORT = 902
+_SHA256_BANNER = "SHA256 supported"
 _NFC_TYPES_REGISTERED = False
+LOG = logging.getLogger(__name__)
 _NFC_SERVICE_MOID_RE = re.compile(r"<nfcService[^>]*>([^<]+)</nfcService>")
 _TASK_POLL_S = 0.5
 _TASK_TIMEOUT_S = 300
 
 
-def _ssl_client_context(verify: bool = True) -> ssl.SSLContext:
-    """Return a client TLS context built with public ``ssl`` APIs."""
+def _ssl_client_context(verify: bool = True, legacy: bool = False) -> ssl.SSLContext:
+    """Return a client TLS context built with public ``ssl`` APIs.
+
+    Args:
+        verify: When False, skip hostname checks and certificate
+            validation.
+        legacy: When True, allow the SHA-1 certificates ESXi 6.5 and
+            6.7.0 authd present. OpenSSL 3's default security level
+            rejects that handshake. ESXi 7 and 8 succeed with
+            ``legacy=False``.
+    """
     context = ssl.create_default_context()
     if not verify:
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
+    if legacy:
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        context.set_ciphers("DEFAULT:@SECLEVEL=1")
     return context
 
 
@@ -180,24 +190,6 @@ def nfc_service(si: vim.ServiceInstance) -> vim.NfcService:
     return nfc_cls(_nfc_service_moid(si), si._stub)
 
 
-def _vim_preferred_api_versions() -> list[str]:
-    """Return pyVmomi vim25 8.x versions, newest first.
-
-    ``SmartConnect`` otherwise walks every version this pyVmomi knows,
-    including 9.x, so a vSphere 9 host would negotiate 9.x SOAP. NFC
-    was reverse-engineered on vSphere 8; keep that family so newer
-    hosts stay on an 8.x ``SOAPAction`` they still advertise.
-    """
-    versions = [
-        v for v in GetServiceVersions("vim25") if v.startswith("vim.version.v8_")
-    ]
-    if not versions:
-        raise RuntimeError(
-            "pyVmomi does not provide vim25 8.x types; OpenVixDiskLib requires them"
-        )
-    return versions
-
-
 def connect_vim(
     host: str,
     username: str,
@@ -237,7 +229,6 @@ def connect_vim(
         thumbprint=thumbprint,
         sslContext=ssl_context,
         disableSslCertValidation=skip_ca,
-        preferredApiVersions=_vim_preferred_api_versions(),
     )
 
 
@@ -295,6 +286,44 @@ def get_nfc_ticket(
     if read_only:
         return nfc.RandomAccessOpenReadonly(vm, disk_device_key, host_for_access)
     return nfc.RandomAccessOpen(vm, disk_device_key, host_for_access)
+
+
+def server_nfc_lib_version(
+    si: vim.ServiceInstance, host: vim.HostSystem | None
+) -> int | None:
+    """Return ``NfcGetServerNfcLibVersion`` for ``host``.
+
+    ESXi 8 answers 11. ESXi 7.0 answers 7. ESXi 6.7 answers 2.
+    ESXi 6.5 answers 0. ESXi 6.0 does not implement the method;
+    that is reported as 0 so the ESXi 8 ``PlainText`` handshake is
+    skipped. Values below 11 skip that handshake, which ESXi 6.7
+    and 6.0 close with ``SESSION_COMPLETE``. ESXi 6.0 then uses
+    synchronous fssrvr I/O because its session-params reply does
+    not advertise a version message.
+    ``None`` means the query failed for another reason; callers keep
+    the ESXi 8 NFC handshake in that case.
+
+    Args:
+        si: Authenticated ServiceInstance.
+        host: Host that serves NFC, usually ``vm.runtime.host``.
+    """
+    if host is None:
+        return None
+    try:
+        return int(nfc_service(si).GetServerNfcLibVersion(host))
+    except vmodl.fault.InvalidRequest as exc:
+        message = getattr(exc, "msg", None) or str(exc)
+        if "NfcGetServerNfcLibVersion" in message:
+            LOG.info(
+                "Host has no NfcGetServerNfcLibVersion; "
+                "using the pre-6.5 NFC handshake"
+            )
+            return 0
+        LOG.warning("Could not read the server NFC library version: %s", exc)
+        return None
+    except Exception as exc:
+        LOG.warning("Could not read the server NFC library version: %s", exc)
+        return None
 
 
 def _format_thumbprint(digest: bytes) -> str:
@@ -363,6 +392,48 @@ def _expect_code(line: str, code: str, what: str) -> str:
     return line[len(code) :].lstrip()
 
 
+def _connect_authd_tls(
+    host: str, port: int, timeout: float
+) -> tuple[ssl.SSLSocket, str]:
+    """Connect to authd and finish the first TLS handshake.
+
+    The default client context is tried first. ESXi 6.5 answers that
+    ClientHello with a handshake failure, and the same TCP sequence is
+    repeated with a legacy context. A failed handshake happens before
+    ``SESSION``, so the NFC ticket is still unused.
+
+    Returns:
+        The TLS socket and the plaintext 220 banner. The socket has
+        ``legacy_tls`` set when the legacy context was required.
+    """
+    last_error: ssl.SSLError | None = None
+    for legacy in (False, True):
+        raw = socket.create_connection((host, port), timeout=timeout)
+        try:
+            banner = _readline(raw)
+            if not banner.startswith("220"):
+                raise ConnectionError(f"unexpected authd banner: {banner}")
+            ssock = _ssl_client_context(verify=False, legacy=legacy).wrap_socket(
+                raw, server_hostname=host
+            )
+        except ssl.SSLError as exc:
+            raw.close()
+            last_error = exc
+            if legacy:
+                raise
+            LOG.info(
+                "authd TLS handshake failed (%s); retrying with legacy ciphers",
+                exc,
+            )
+            continue
+        except Exception:
+            raw.close()
+            raise
+        ssock.legacy_tls = legacy  # type: ignore[attr-defined]
+        return ssock, banner
+    raise ConnectionError(f"authd TLS handshake failed: {last_error}")
+
+
 def nfcssl_service_name(service: str) -> str:
     """Return the NFCSSL authd PROXY service for an NFC service name.
 
@@ -391,12 +462,23 @@ def connect_authd(
     1. Read the plaintext 220 banner, then wrap the socket with TLS.
     2. SESSION <sessionId>
     3. BANNER
-    4. THUMBPRINT_SHA2 PlainText
+    4. THUMBPRINT_SHA2 PlainText, only when the banner advertises
+       ``SHA256 supported`` (ESXi 8). ESXi 6.5, 6.7, and 7 omit that
+       token and answer the command with ``530 Please login with USER
+       and PASS``.
     5. PROXY <ticket.service>     (vpxa-nfc / nbd) or vpxa-nfcssl (nbdssl)
 
-    ``THUMBPRINT_SHA2 PlainText`` is used for both transports. NBDSSL
-    is selected by the PROXY service name; after ``200 Connect
-    ha-nfcssl`` a second TLS handshake is started in ``nfc_open``.
+    ``THUMBPRINT_SHA2 PlainText`` is used for both transports when the
+    banner allows it. NBDSSL is selected by the PROXY service name;
+    after ``200 Connect ha-nfcssl`` a second TLS handshake is started
+    in ``nfc_open``.
+
+    TLS uses the default client context first, which ESXi 7 and 8
+    accept. ESXi 6.5 and 6.7.0 authd reject that handshake, and the
+    connect is retried with ``@SECLEVEL=1`` so their SHA-1
+    certificates are allowed.
+    The successful socket is marked ``legacy_tls`` for the NBDSSL
+    wrap.
 
     Args:
         ticket: One-time ticket from get_nfc_ticket().
@@ -412,17 +494,8 @@ def connect_authd(
     """
     host = ticket.host or fallback_host
     port = ticket.port or AUTHD_DEFAULT_PORT
-    raw = socket.create_connection((host, port), timeout=timeout)
-    try:
-        banner = _readline(raw)
-        if not banner.startswith("220"):
-            raise ConnectionError(f"unexpected authd banner: {banner}")
-
-        ssl_context = _ssl_client_context(verify=False)
-        ssock = ssl_context.wrap_socket(raw, server_hostname=host)
-    except Exception:
-        raw.close()
-        raise
+    ssock, banner = _connect_authd_tls(host, port, timeout)
+    sha256_supported = _SHA256_BANNER in banner
 
     try:
         if not allow_untrusted and ticket.sslThumbprint:
@@ -443,8 +516,13 @@ def connect_authd(
         ssock.sendall(b"BANNER \r\n")
         _expect_code(_readline(ssock), "220", "BANNER")
 
-        ssock.sendall(b"THUMBPRINT_SHA2 PlainText\r\n")
-        _expect_code(_readline(ssock), "200", "THUMBPRINT_SHA2")
+        if sha256_supported:
+            ssock.sendall(b"THUMBPRINT_SHA2 PlainText\r\n")
+            _expect_code(_readline(ssock), "200", "THUMBPRINT_SHA2")
+        else:
+            LOG.info(
+                "authd banner does not advertise SHA256; skipping THUMBPRINT_SHA2"
+            )
 
         service = ticket.service or "vpxa-nfc"
         if nfc_ssl:
