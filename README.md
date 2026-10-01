@@ -37,13 +37,16 @@ Default transport is `nbdssl` (`nbd` is still available):
   VDDK's cost and behavior)
 - `VixDiskLib_QueryAllocatedBlocks` (allocated-block bitmap; see
   `docs/nfc_read.md`)
+- Changed Block Tracking: `openvixdisklib.nfc_auth.enable_change_tracking`
+  / `disk_change_id` / `query_changed_disk_areas` (public VIM API, not
+  part of VixDiskLib itself; see `docs/cbt.md`)
 
 Reading/writing a snapshot delta file directly (and running
 `query_allocated_blocks` against it) already works — `NFC_DELTA_DISK`
 turned out to be an optional VMFS-only VDDK client optimization, not a
 correctness requirement (see `docs/reverse_engineering_procedure.md`).
 
-Not implemented: compression open flags other than FastLZ, CBT, and
+Not implemented: compression open flags other than FastLZ, and
 encrypted disks.
 
 Requires Python 3.10 or later.
