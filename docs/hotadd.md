@@ -43,6 +43,16 @@ mode. On a bare-metal host that is `nbdssl`. Inside a guest it is
    The source VMDK must not be deleted. Leftover attachments of the
    same backing are detached before a new open.
 
+Opens and closes on this guest are serialized. vSphere runs one
+`ReconfigureVM` task per proxy and answers a second one with
+`TaskInProgress`. The lock is a `threading.RLock` plus a flock
+(`/var/lock/openvixdisklib-hotadd.lock`, or `/tmp` when that directory
+is not writable). It is held from SCSI planning through the task and
+until the guest device appears or disappears, so two attaches cannot
+pick the same unit. A conflicting task is waited out and the SCSI spec
+is built again. Reads and writes after a successful open stay
+concurrent.
+
 Never HotAdd the proxy's own boot disk. Never use “newest `sdX`” as the
 only match when a unique SCSI address exists.
 

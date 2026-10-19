@@ -7,6 +7,10 @@ The source disk may sit on SCSI, NVMe, or SATA in the backup VM. This
 module always HotAdds that backing onto a SCSI controller of the proxy
 VM (the guest running this process), then I/Os ``/dev/sdX``. IDE disks
 and RDMs are not supported.
+
+Attaches and detaches share one lock on this guest. vSphere runs a
+single ReconfigVM task per proxy, so a second open waits and chooses a
+free SCSI unit again instead of failing with TaskInProgress.
 """
 
 from __future__ import annotations
@@ -15,8 +19,10 @@ import fcntl
 import logging
 import os
 import struct
+import threading
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 from pyVmomi import vim
@@ -33,6 +39,11 @@ SCSI_CHANNEL = 0
 SCSI_LUN = 0
 TASK_POLL_S = 0.5
 TASK_TIMEOUT_S = 300
+# Rebuild the SCSI spec this many times after TaskInProgress.
+RECONFIGURE_ATTEMPTS = 10
+# Pause when the conflicting task has no pollable reference.
+BUSY_RETRY_S = 2.0
+HOTADD_LOCK_NAME = "openvixdisklib-hotadd.lock"
 DEVICE_WAIT_S = 120
 DEVICE_POLL_S = 0.5
 DMI_VENDOR_PATH = "/sys/class/dmi/id/sys_vendor"
@@ -324,6 +335,110 @@ def build_detach_spec(device: vim.vm.device.VirtualDisk) -> vim.vm.ConfigSpec:
     return spec
 
 
+class _ReconfigureBusy(Exception):
+    """The proxy already has a ReconfigVM task running."""
+
+    def __init__(self, fault: object) -> None:
+        super().__init__(f"vSphere task failed: {fault}")
+        self.fault = fault
+
+
+class _LockDepth(threading.local):
+    depth: int = 0
+
+
+_THREAD_LOCK = threading.RLock()
+_LOCK_DEPTH = _LockDepth()
+
+
+def _task_in_progress(error: object) -> object | None:
+    """Return a TaskInProgress fault, or None for any other error."""
+    if isinstance(error, vim.fault.TaskInProgress):
+        return error
+    if type(error).__name__ == "TaskInProgress":
+        return error
+    return None
+
+
+def _hotadd_lock_path() -> str:
+    """Return a flock path shared by every process on this proxy."""
+    override = os.environ.get("OPENVIXDISKLIB_HOTADD_LOCK_DIR")
+    directories = [override] if override else ["/var/lock", "/tmp"]
+    last_error: OSError | None = None
+    for directory in directories:
+        if not directory:
+            continue
+        try:
+            os.makedirs(directory, exist_ok=True)
+            path = os.path.join(directory, HOTADD_LOCK_NAME)
+            fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o666)
+        except OSError as exc:
+            last_error = exc
+            continue
+        try:
+            os.chmod(path, 0o666)
+        except OSError:
+            pass
+        os.close(fd)
+        return path
+    raise RuntimeError(f"cannot create HotAdd lock file: {last_error}")
+
+
+def _acquire_hotadd_flock() -> int:
+    """Take the cross-process HotAdd lock and return its file descriptor.
+
+    The descriptor is read-only. ``flock`` does not need write access, so
+    a lock file created by another user can still be taken.
+    """
+    path = _hotadd_lock_path()
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except OSError:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _release_hotadd_flock(fd: int) -> None:
+    """Unlock and close a descriptor from ``_acquire_hotadd_flock``."""
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def _proxy_reconfigure_lock(vm: vim.VirtualMachine) -> Iterator[None]:
+    """Serialize HotAdd ReconfigVM for this guest.
+
+    Planning and the vSphere task both run under the lock, so two
+    attaches cannot choose the same SCSI unit. The holding thread may
+    re-enter to detach a leftover disk. Other processes on this proxy
+    share the flock. ``vm`` is the proxy being reconfigured; HotAdd
+    always targets this guest, so one lock covers it.
+    """
+    del vm
+    _THREAD_LOCK.acquire()
+    depth = _LOCK_DEPTH.depth
+    fd: int | None = None
+    try:
+        if depth == 0:
+            fd = _acquire_hotadd_flock()
+        _LOCK_DEPTH.depth = depth + 1
+        try:
+            yield
+        finally:
+            _LOCK_DEPTH.depth = depth
+    finally:
+        if fd is not None:
+            _release_hotadd_flock(fd)
+        _THREAD_LOCK.release()
+
+
 def _wait_for_task(task: vim.Task) -> object:
     deadline = time.monotonic() + TASK_TIMEOUT_S
     while task.info.state in (vim.TaskInfo.State.running, vim.TaskInfo.State.queued):
@@ -331,8 +446,28 @@ def _wait_for_task(task: vim.Task) -> object:
             raise TimeoutError(f"timed out waiting for vSphere task {task}")
         time.sleep(TASK_POLL_S)
     if task.info.state != vim.TaskInfo.State.success:
+        fault = _task_in_progress(task.info.error)
+        if fault is not None:
+            raise _ReconfigureBusy(fault)
         raise RuntimeError(f"vSphere task failed: {task.info.error}")
     return task.info.result
+
+
+def _wait_for_conflicting_task(fault: object) -> None:
+    """Block until the ReconfigVM named by ``fault`` leaves the queue.
+
+    ``fault`` is a ``vim.fault.TaskInProgress``. When it carries no task
+    reference, pause briefly so the next attempt is not immediate.
+    """
+    task = getattr(fault, "task", None)
+    if task is None or not hasattr(task, "info"):
+        time.sleep(BUSY_RETRY_S)
+        return
+    deadline = time.monotonic() + TASK_TIMEOUT_S
+    while task.info.state in (vim.TaskInfo.State.running, vim.TaskInfo.State.queued):
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"timed out waiting for vSphere task {task} to finish")
+        time.sleep(TASK_POLL_S)
 
 
 def _boot_disk_path(devices: Iterable[vim.vm.device.VirtualDevice]) -> str | None:
@@ -355,18 +490,46 @@ def _disks_with_backing(
 
 
 def _reconfigure(vm: vim.VirtualMachine, spec: vim.vm.ConfigSpec) -> None:
-    _wait_for_task(vm.ReconfigVM_Task(spec))
-    vm.Reload()
+    """Run one ReconfigVM. Raise ``_ReconfigureBusy`` when the VM is busy."""
+    with _proxy_reconfigure_lock(vm):
+        try:
+            task = vm.ReconfigVM_Task(spec)
+        except Exception as exc:
+            fault = _task_in_progress(exc)
+            if fault is None:
+                raise
+            raise _ReconfigureBusy(fault) from exc
+        _wait_for_task(task)
+        vm.Reload()
 
 
 def _detach_device(vm: vim.VirtualMachine, device: vim.vm.device.VirtualDisk) -> None:
+    """Remove ``device`` from ``vm``, waiting out a conflicting reconfigure."""
     LOG.info(
         "HotAdd detach %s unit=%s from %s",
         getattr(device.backing, "fileName", None),
         device.unitNumber,
         vm._moId,
     )
-    _reconfigure(vm, build_detach_spec(device))
+    spec = build_detach_spec(device)
+    last_error: Exception | None = None
+    for attempt in range(RECONFIGURE_ATTEMPTS):
+        try:
+            _reconfigure(vm, spec)
+        except _ReconfigureBusy as exc:
+            last_error = exc
+            LOG.warning(
+                "HotAdd detach on %s is busy (attempt %s/%s)",
+                vm._moId,
+                attempt + 1,
+                RECONFIGURE_ATTEMPTS,
+            )
+            _wait_for_conflicting_task(exc.fault)
+        else:
+            return
+    raise RuntimeError(
+        f"HotAdd detach on {vm._moId} is still in progress"
+    ) from last_error
 
 
 def _scsi_sysfs(bus: int, unit: int) -> str:
@@ -642,52 +805,50 @@ class HotAddDisk:
         self.close()
 
 
-def open_disk(
-    si: vim.ServiceInstance,
-    source_vm: vim.VirtualMachine,
+@dataclass
+class _OpenedHotAdd:
+    """Block device fd plus the proxy disk created for it."""
+
+    fd: int
+    dev_path: str
+    bus_number: int
+    unit_number: int
+    device: vim.vm.device.VirtualDisk
+
+
+def _reload_proxy(proxy: vim.VirtualMachine) -> None:
+    """Reload ``proxy`` so the next SCSI plan sees the latest devices."""
+    try:
+        proxy.Reload()
+    except Exception as exc:
+        fault = _task_in_progress(exc)
+        if fault is None:
+            raise
+        raise _ReconfigureBusy(fault) from exc
+
+
+def _hotadd_attach_once(
+    proxy: vim.VirtualMachine,
     disk_path: str,
-    snapshot_ref: str | None = None,
-    read_only: bool = True,
-) -> HotAddDisk:
-    """HotAdd ``disk_path`` from ``source_vm`` onto this guest and open it.
-
-    The source VM must be powered off, or ``snapshot_ref`` must name a
-    snapshot whose hardware contains ``disk_path``. The disk is always
-    attached to a SCSI controller on the proxy.
-
-    Args:
-        si: Logged-in VIM session.
-        source_vm: VM that owns ``disk_path``.
-        disk_path: Datastore path of the VMDK.
-        snapshot_ref: Snapshot moref required when ``source_vm`` is on.
-        read_only: Independent-nonpersistent attach when True.
-    """
-    if not is_vmware_guest():
-        raise RuntimeError("HotAdd requires a VMware guest (the backup proxy)")
-    if (
-        source_vm.runtime.powerState == vim.VirtualMachinePowerState.poweredOn
-        and not snapshot_ref
-    ):
-        raise RuntimeError(
-            "snapshot_ref is required to HotAdd a powered-on virtual machine"
-        )
-
-    proxy = find_proxy_vm(si)
+    read_only: bool,
+    capacity_kb: int | None,
+) -> _OpenedHotAdd:
+    """Attach ``disk_path`` once. Raise ``_ReconfigureBusy`` to replan."""
+    _reload_proxy(proxy)
     proxy_devices = list(proxy.config.hardware.device)
     boot_path = _boot_disk_path(proxy_devices)
     if boot_path == disk_path:
         raise RuntimeError("refusing to HotAdd the proxy VM's boot disk")
 
     for leftover in _disks_with_backing(proxy_devices, disk_path):
-        LOG.warning("detaching leftover HotAdd disk %s from %s", disk_path, proxy._moId)
+        LOG.warning(
+            "detaching leftover HotAdd disk %s from %s", disk_path, proxy._moId
+        )
         _detach_device(proxy, leftover)
-        proxy_devices = list(proxy.config.hardware.device)
 
-    devices = source_devices(source_vm, snapshot_ref)
-    source = find_source_disk(devices, disk_path)
-    capacity = getattr(source, "capacityInKB", None)
+    proxy_devices = list(proxy.config.hardware.device)
     plan = build_attach_spec(
-        proxy_devices, disk_path, read_only=read_only, capacity_kb=capacity
+        proxy_devices, disk_path, read_only=read_only, capacity_kb=capacity_kb
     )
     LOG.info(
         "HotAdd attach %s onto %s SCSI %s:%s read_only=%s",
@@ -717,6 +878,8 @@ def open_disk(
         dev_path = wait_for_scsi_device(bus, unit, before=before)
         flags = os.O_RDONLY if read_only else os.O_RDWR
         fd = os.open(dev_path, flags)
+    except _ReconfigureBusy:
+        raise
     except Exception:
         victim = attached
         if victim is None:
@@ -725,19 +888,102 @@ def open_disk(
         if victim is not None:
             _detach_best_effort(proxy, victim)
         raise
+    if attached is None:
+        raise RuntimeError(f"HotAdd did not attach {disk_path}")
+    return _OpenedHotAdd(
+        fd=fd,
+        dev_path=dev_path,
+        bus_number=bus,
+        unit_number=unit,
+        device=attached,
+    )
+
+
+def _hotadd_attach(
+    proxy: vim.VirtualMachine,
+    disk_path: str,
+    read_only: bool,
+    capacity_kb: int | None,
+) -> _OpenedHotAdd:
+    """Attach ``disk_path``, replanning when the proxy reconfigure is busy."""
+    last_error: Exception | None = None
+    for attempt in range(RECONFIGURE_ATTEMPTS):
+        try:
+            return _hotadd_attach_once(proxy, disk_path, read_only, capacity_kb)
+        except _ReconfigureBusy as exc:
+            last_error = exc
+            LOG.warning(
+                "HotAdd attach of %s on %s is busy (attempt %s/%s)",
+                disk_path,
+                proxy._moId,
+                attempt + 1,
+                RECONFIGURE_ATTEMPTS,
+            )
+            _wait_for_conflicting_task(exc.fault)
+    raise RuntimeError(
+        f"HotAdd reconfigure of {proxy._moId} is still in progress"
+    ) from last_error
+
+
+def open_disk(
+    si: vim.ServiceInstance,
+    source_vm: vim.VirtualMachine,
+    disk_path: str,
+    snapshot_ref: str | None = None,
+    read_only: bool = True,
+) -> HotAddDisk:
+    """HotAdd ``disk_path`` from ``source_vm`` onto this guest and open it.
+
+    The source VM must be powered off, or ``snapshot_ref`` must name a
+    snapshot whose hardware contains ``disk_path``. The disk is always
+    attached to a SCSI controller on the proxy. Opens and closes on this
+    guest run one at a time. When the proxy already has a ReconfigVM
+    task, the open waits for it and picks a free SCSI unit again.
+
+    Args:
+        si: Logged-in VIM session.
+        source_vm: VM that owns ``disk_path``.
+        disk_path: Datastore path of the VMDK.
+        snapshot_ref: Snapshot moref required when ``source_vm`` is on.
+        read_only: Independent-nonpersistent attach when True.
+    """
+    if not is_vmware_guest():
+        raise RuntimeError("HotAdd requires a VMware guest (the backup proxy)")
+    if (
+        source_vm.runtime.powerState == vim.VirtualMachinePowerState.poweredOn
+        and not snapshot_ref
+    ):
+        raise RuntimeError(
+            "snapshot_ref is required to HotAdd a powered-on virtual machine"
+        )
+
+    proxy = find_proxy_vm(si)
+    devices = source_devices(source_vm, snapshot_ref)
+    source = find_source_disk(devices, disk_path)
+    capacity = getattr(source, "capacityInKB", None)
+    with _proxy_reconfigure_lock(proxy):
+        opened = _hotadd_attach(proxy, disk_path, read_only, capacity)
 
     def _detach() -> None:
-        try:
-            _detach_device(proxy, attached)
-        finally:
-            wait_scsi_device_gone(bus, unit)
+        with _proxy_reconfigure_lock(proxy):
+            try:
+                _detach_device(proxy, opened.device)
+            finally:
+                wait_scsi_device_gone(opened.bus_number, opened.unit_number)
 
-    size = _capacity_bytes(fd)
+    size = _capacity_bytes(opened.fd)
     info = DiskInfo(
         capacity_sectors=size // SECTOR_SIZE,
         phys_geo=DiskGeometry(cylinders=0, heads=0, sectors=0),
     )
-    return HotAddDisk(fd, dev_path, bus, unit, _detach, info=info)
+    return HotAddDisk(
+        opened.fd,
+        opened.dev_path,
+        opened.bus_number,
+        opened.unit_number,
+        _detach,
+        info=info,
+    )
 
 
 def _detach_best_effort(
@@ -749,5 +995,6 @@ def _detach_best_effort(
         unit = device.unitNumber
         if unit is not None:
             _offline_scsi_unit(int(unit))
+            wait_scsi_device_gone(0, int(unit))
     except Exception:
         LOG.exception("HotAdd cleanup after failed open")
