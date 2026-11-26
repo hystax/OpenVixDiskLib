@@ -44,6 +44,7 @@ RECONFIGURE_ATTEMPTS = 10
 # Pause when the conflicting task has no pollable reference.
 BUSY_RETRY_S = 2.0
 HOTADD_LOCK_NAME = "openvixdisklib-hotadd.lock"
+HOTADD_DISK_LABEL = "openvixdisklib-hotadd"
 DEVICE_WAIT_S = 120
 DEVICE_POLL_S = 0.5
 DMI_VENDOR_PATH = "/sys/class/dmi/id/sys_vendor"
@@ -312,7 +313,7 @@ def build_attach_spec(
     if capacity_kb:
         disk.capacityInKB = capacity_kb
     disk.deviceInfo = vim.Description()
-    disk.deviceInfo.label = "openvixdisklib-hotadd"
+    disk.deviceInfo.label = HOTADD_DISK_LABEL
     disk.deviceInfo.summary = file_name
 
     disk_spec = vim.vm.device.VirtualDeviceSpec()
@@ -471,10 +472,113 @@ def _wait_for_conflicting_task(fault: object) -> None:
 
 
 def _boot_disk_path(devices: Iterable[vim.vm.device.VirtualDevice]) -> str | None:
+    boot = _proxy_boot_disk(devices)
+    if boot is None:
+        return None
+    return getattr(boot.backing, "fileName", None)
+
+
+def _proxy_boot_disk(
+    devices: Iterable[vim.vm.device.VirtualDevice],
+) -> vim.vm.device.VirtualDisk | None:
     for device in devices:
         if isinstance(device, vim.vm.device.VirtualDisk):
-            return getattr(device.backing, "fileName", None)
+            return device
     return None
+
+
+def backing_filenames(backing: object) -> list[str]:
+    """Return ``backing`` and each parent ``fileName``, leaf first."""
+    names: list[str] = []
+    seen: set[str] = set()
+    current = backing
+    while current is not None:
+        name = getattr(current, "fileName", None)
+        if not name or name in seen:
+            break
+        seen.add(name)
+        names.append(name)
+        current = getattr(current, "parent", None)
+    return names
+
+
+def source_disk_chain(vm: vim.VirtualMachine) -> set[str]:
+    """Return every backing path used by ``vm``'s virtual disks."""
+    names: set[str] = set()
+    hardware = getattr(getattr(vm, "config", None), "hardware", None)
+    if hardware is None:
+        return names
+    for device in getattr(hardware, "device", None) or []:
+        if isinstance(device, vim.vm.device.VirtualDisk):
+            names.update(backing_filenames(device.backing))
+    return names
+
+
+def _is_boot_disk(
+    device: vim.vm.device.VirtualDisk,
+    boot: vim.vm.device.VirtualDisk | None,
+) -> bool:
+    if boot is None:
+        return False
+    if device is boot:
+        return True
+    return device.key is not None and device.key == boot.key
+
+
+def disks_on_chain(
+    devices: Iterable[vim.vm.device.VirtualDevice],
+    chain_names: set[str],
+) -> list[vim.vm.device.VirtualDisk]:
+    """Return non-boot disks whose backing chain intersects ``chain_names``.
+
+    A match is the disk's own ``fileName`` or any parent backing. The
+    proxy boot disk is never returned.
+    """
+    device_list = list(devices)
+    boot = _proxy_boot_disk(device_list)
+    matches = []
+    for device in device_list:
+        if not isinstance(device, vim.vm.device.VirtualDisk):
+            continue
+        if _is_boot_disk(device, boot):
+            continue
+        if any(name in chain_names for name in backing_filenames(device.backing)):
+            matches.append(device)
+    return matches
+
+
+def _detach_selected(
+    proxy: vim.VirtualMachine,
+    select: Callable[
+        [list[vim.vm.device.VirtualDevice]],
+        list[vim.vm.device.VirtualDisk],
+    ],
+) -> int:
+    """Detach disks chosen by ``select`` until none remain."""
+    detached = 0
+    limit: int | None = None
+    while True:
+        _reload_proxy(proxy)
+        devices = list(proxy.config.hardware.device)
+        if limit is None:
+            limit = sum(
+                isinstance(device, vim.vm.device.VirtualDisk) for device in devices
+            )
+        chosen = select(devices)
+        if not chosen:
+            return detached
+        if detached >= limit:
+            raise RuntimeError(
+                f"HotAdd detach left disks attached on {proxy._moId}"
+            )
+        disk = chosen[0]
+        LOG.warning(
+            "detaching leftover HotAdd disk %s from %s",
+            getattr(disk.backing, "fileName", None),
+            proxy._moId,
+        )
+        _detach_device(proxy, disk)
+        detached += 1
 
 
 def _disks_with_backing(
@@ -832,21 +936,23 @@ def _hotadd_attach_once(
     disk_path: str,
     read_only: bool,
     capacity_kb: int | None,
+    chain_names: set[str] | None = None,
 ) -> _OpenedHotAdd:
-    """Attach ``disk_path`` once. Raise ``_ReconfigureBusy`` to replan."""
+    """Attach ``disk_path`` once. Raise ``_ReconfigureBusy`` to replan.
+
+    ``chain_names`` are the source disk and its parents. A leftover
+    attach of any of those paths is detached before this open. An exact
+    path match is the previous behavior; the parent paths cover a base
+    disk left behind while later runs open a snapshot delta.
+    """
+    names = set(chain_names or ())
+    names.add(disk_path)
+    _detach_selected(proxy, lambda devices: disks_on_chain(devices, names))
     _reload_proxy(proxy)
     proxy_devices = list(proxy.config.hardware.device)
     boot_path = _boot_disk_path(proxy_devices)
     if boot_path == disk_path:
         raise RuntimeError("refusing to HotAdd the proxy VM's boot disk")
-
-    for leftover in _disks_with_backing(proxy_devices, disk_path):
-        LOG.warning(
-            "detaching leftover HotAdd disk %s from %s", disk_path, proxy._moId
-        )
-        _detach_device(proxy, leftover)
-
-    proxy_devices = list(proxy.config.hardware.device)
     plan = build_attach_spec(
         proxy_devices, disk_path, read_only=read_only, capacity_kb=capacity_kb
     )
@@ -904,12 +1010,15 @@ def _hotadd_attach(
     disk_path: str,
     read_only: bool,
     capacity_kb: int | None,
+    chain_names: set[str] | None = None,
 ) -> _OpenedHotAdd:
     """Attach ``disk_path``, replanning when the proxy reconfigure is busy."""
     last_error: Exception | None = None
     for attempt in range(RECONFIGURE_ATTEMPTS):
         try:
-            return _hotadd_attach_once(proxy, disk_path, read_only, capacity_kb)
+            return _hotadd_attach_once(
+                proxy, disk_path, read_only, capacity_kb, chain_names
+            )
         except _ReconfigureBusy as exc:
             last_error = exc
             LOG.warning(
@@ -923,6 +1032,29 @@ def _hotadd_attach(
     raise RuntimeError(
         f"HotAdd reconfigure of {proxy._moId} is still in progress"
     ) from last_error
+
+
+def release_source_hotadd(
+    si: vim.ServiceInstance, source_vm: vim.VirtualMachine
+) -> int:
+    """Detach this proxy's HotAdd disks that belong to ``source_vm``.
+
+    A proxy disk matches when its backing path, or a parent backing
+    path, is one of the source VM's disk files. The proxy boot disk is
+    left in place. Returns 0 when this process is not a VMware guest.
+
+    Call this before removing the source snapshot. Snapshot deletion
+    consolidates redo logs, and that combine fails while a HotAdd child
+    of the base disk still exists.
+    """
+    if not is_vmware_guest():
+        return 0
+    chain = source_disk_chain(source_vm)
+    if not chain:
+        return 0
+    proxy = find_proxy_vm(si)
+    with _proxy_reconfigure_lock(proxy):
+        return _detach_selected(proxy, lambda devices: disks_on_chain(devices, chain))
 
 
 def open_disk(
@@ -961,8 +1093,9 @@ def open_disk(
     devices = source_devices(source_vm, snapshot_ref)
     source = find_source_disk(devices, disk_path)
     capacity = getattr(source, "capacityInKB", None)
+    chain = set(backing_filenames(source.backing))
     with _proxy_reconfigure_lock(proxy):
-        opened = _hotadd_attach(proxy, disk_path, read_only, capacity)
+        opened = _hotadd_attach(proxy, disk_path, read_only, capacity, chain)
 
     def _detach() -> None:
         with _proxy_reconfigure_lock(proxy):
